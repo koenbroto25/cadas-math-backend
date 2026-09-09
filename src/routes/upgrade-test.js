@@ -1,24 +1,16 @@
-/**
+﻿/**
  * Upgrade Test API Endpoints
  */
 
 const express = require('express');
 const router = express.Router();
-const { Pool } = require('pg');
-
-const pool = new Pool({
-  host: process.env.DB_HOST || 'localhost',
-  port: parseInt(process.env.DB_PORT || '5432'),
-  user: process.env.DB_USER || 'postgres',
-  password: process.env.DB_PASSWORD || 'postgres',
-  database: process.env.DB_NAME || 'cadas_app_dev'
-});
+const db = require('../database/db');
 
 /**
- * Helper: Get level access based on Addendum v1 §1.2
+ * Helper: Get level access based on Addendum v1 Â§1.2
  */
 async function getLevelAccess(studentId, level) {
-  const result = await pool.query(
+  const result = await db.query(
     'SELECT trial_level, paid_basic_up_to_level, paid_premium_up_to_level FROM students WHERE id = $1',
     [studentId]
   );
@@ -60,7 +52,7 @@ router.get('/:level', async (req, res) => {
       });
     }
 
-    const testResult = await pool.query(
+    const testResult = await db.query(
       'SELECT * FROM upgrade_tests WHERE level = $1 ORDER BY created_at LIMIT 1',
       [level]
     );
@@ -101,7 +93,7 @@ router.post('/:test_id/submit', async (req, res) => {
 
     if (!studentId || !answers) return res.status(400).json({ error: 'studentId and answers required' });
 
-    const testResult = await pool.query('SELECT * FROM upgrade_tests WHERE id = $1', [testId]);
+    const testResult = await db.query('SELECT * FROM upgrade_tests WHERE id = $1', [testId]);
     if (testResult.rows.length === 0) return res.status(404).json({ error: 'Test not found' });
 
     const test = testResult.rows[0];
@@ -125,7 +117,7 @@ router.post('/:test_id/submit', async (req, res) => {
     const passed = accuracy >= threshold && withinTime;
 
     if (passed) {
-      await pool.query(
+      await db.query(
         'UPDATE students SET current_level = GREATEST(current_level, $1) WHERE id = $2',
         [test.level_to, studentId]
       );

@@ -1,22 +1,22 @@
-/**
- * FASE 3.1 — Auth: register/login 3 role + Parent Gate.
+﻿/**
+ * FASE 3.1 â€” Auth: register/login 3 role + Parent Gate.
  *
- * Urutan onboarding mengikuti [ADD] §6.2 (OVERRIDE): siswa daftar TANPA
- * registrasi orang tua — orang tua baru daftar SETELAH placement (FASE 4).
+ * Urutan onboarding mengikuti [ADD] Â§6.2 (OVERRIDE): siswa daftar TANPA
+ * registrasi orang tua â€” orang tua baru daftar SETELAH placement (FASE 4).
  * Maka: student/register hanya bikin profil anak, TANPA email/password.
  */
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const db = require('../database/db');
-const { signToken, verifyToken } = require('../middleware/auth');
+const { signToken, verifyToken, requireRole } = require('../middleware/auth');
 
 const router = express.Router();
 const BCRYPT_ROUNDS = 10;
 
-// ── STUDENT ────────────────────────────────────────────────────────────────
+// â”€â”€ STUDENT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // POST /api/auth/student/register  { name, kelas }
-// → 200 { student_id } — TIDAK minta email/password (urutan [ADD] §6.2)
+// â†’ 200 { student_id } â€” TIDAK minta email/password (urutan [ADD] Â§6.2)
 router.post('/student/register', async (req, res) => {
   const { name, kelas } = req.body || {};
   if (!name || typeof name !== 'string' || name.trim().length < 2) {
@@ -36,7 +36,7 @@ router.post('/student/register', async (req, res) => {
       [username, name.trim(), grade]
     );
     const student = r.rows[0];
-    // Token siswa: untuk identitas device-profile (tanpa login mandiri, V3 §5.3)
+    // Token siswa: untuk identitas device-profile (tanpa login mandiri, V3 Â§5.3)
     res.status(201).json({
       student_id: student.id,
       student,
@@ -48,7 +48,7 @@ router.post('/student/register', async (req, res) => {
   }
 });
 
-// ── PARENT ─────────────────────────────────────────────────────────────────
+// â”€â”€ PARENT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // POST /api/auth/parent/register  { name, email?, phone?, password }
 router.post('/parent/register', async (req, res) => {
   const { name, email, phone, password } = req.body || {};
@@ -111,7 +111,7 @@ router.post('/parent/login', async (req, res) => {
   }
 });
 
-// ── TEACHER ────────────────────────────────────────────────────────────────
+// â”€â”€ TEACHER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // POST /api/auth/teacher/register  { name, email, password, teacher_type }
 // teacher_type: 'school' (classroom gratis, 0% komisi) | 'private' (referral+komisi)
 router.post('/teacher/register', async (req, res) => {
@@ -133,7 +133,7 @@ router.post('/teacher/register', async (req, res) => {
       [email.toLowerCase(), name.trim(), teacher_type, hash]
     );
     const teacher = r.rows[0];
-    // Guru baru BELUM verified — tidak bisa bikin classroom/referral sampai FASE 11 approval
+    // Guru baru BELUM verified â€” tidak bisa bikin classroom/referral sampai FASE 11 approval
     res.status(201).json({
       teacher_id: teacher.id,
       teacher,
@@ -176,10 +176,10 @@ router.post('/teacher/login', async (req, res) => {
   }
 });
 
-// ── PARENT GATE ([V3] §5.2) ────────────────────────────────────────────────
+// â”€â”€ PARENT GATE ([V3] Â§5.2) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Soal perkalian sederhana sebelum masuk area Parent/Guru dari sesi anak.
 // Challenge stateless: jawaban ditandatangani ke dalam token ber-TTL 2 menit.
-// GET /api/auth/parent-gate/challenge → { challenge_token, question }
+// GET /api/auth/parent-gate/challenge â†’ { challenge_token, question }
 const jwt = require('jsonwebtoken');
 const SECRET = process.env.JWT_SECRET || 'cadas_app_secure_secret_key_2026';
 
@@ -187,11 +187,11 @@ router.get('/parent-gate/challenge', (req, res) => {
   const a = 2 + Math.floor(Math.random() * 8); // 2..9
   const b = 2 + Math.floor(Math.random() * 8); // 2..9
   const challengeToken = jwt.sign({ ans: a * b, kind: 'gate_challenge' }, SECRET, { expiresIn: '2m' });
-  res.json({ challenge_token: challengeToken, question: `${a} × ${b} = ?` });
+  res.json({ challenge_token: challengeToken, question: `${a} Ã— ${b} = ?` });
 });
 
 // POST /api/auth/parent-gate/verify  { challenge_token, answer }
-// → benar: { gate_token } (TTL 15 menit, dipakai utk akses area parent/guru)
+// â†’ benar: { gate_token } (TTL 15 menit, dipakai utk akses area parent/guru)
 router.post('/parent-gate/verify', (req, res) => {
   const { challenge_token, answer } = req.body || {};
   if (!challenge_token || answer === undefined) {
@@ -203,20 +203,62 @@ router.post('/parent-gate/verify', (req, res) => {
       return res.status(401).json({ error: 'challenge tidak valid' });
     }
     if (Number(answer) !== Number(payload.ans)) {
-      return res.status(401).json({ error: 'jawaban salah — bukan orang tua/wali?' });
+      return res.status(401).json({ error: 'jawaban salah â€” bukan orang tua/wali?' });
     }
     res.json({ gate_token: signToken({ kind: 'gate_pass' }, '15m') });
   } catch {
-    return res.status(401).json({ error: 'challenge kedaluwarsa — minta yang baru' });
+    return res.status(401).json({ error: 'challenge kedaluwarsa â€” minta yang baru' });
   }
 });
 
-// GET /api/auth/me — echo payload token (uji middleware + dipakai app
+// GET /api/auth/me â€” echo payload token (uji middleware + dipakai app
 // untuk cek identitas setelah login: role, sub, verified)
 router.get('/me', verifyToken, (req, res) => {
   res.json({ auth: req.auth });
 });
 
+
+// -- STUDENT LOGIN --------------------------------------------------------
+// POST /api/auth/student/login  { student_id }
+// Siswa tidak punya password -- login dengan student_id yang disimpan di device.
+router.post('/student/login', async (req, res) => {
+  const { student_id } = req.body || {};
+  if (!student_id || typeof student_id !== 'string') {
+    return res.status(400).json({ error: 'student_id wajib diisi' });
+  }
+  try {
+    const r = await db.query(
+      'SELECT id, username, display_name AS name, grade_level AS kelas, current_level, trial_level, paid_basic_up_to_level, paid_premium_up_to_level FROM students WHERE id = ' + '',
+      [student_id]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'siswa tidak ditemukan' });
+    const student = r.rows[0];
+    res.json({ student_id: student.id, student, token: signToken({ sub: student.id, role: 'student' }) });
+  } catch (err) {
+    console.error('student/login:', err.message);
+    res.status(500).json({ error: 'gagal login' });
+  }
+});
+// -- PARENT LINK CHILD ---------------------------------------------------
+// POST /api/auth/parent/link-child  { student_id }
+// Parent menghubungkan akun ke anak yang sudah terdaftar
+router.post('/parent/link-child', verifyToken, requireRole('parent'), async (req, res) => {
+  const { student_id } = req.body || {};
+  if (!student_id) return res.status(400).json({ error: 'student_id wajib diisi' });
+  try {
+    const s = await db.query('SELECT id, display_name, current_level, trial_level FROM students WHERE id = $1', [student_id]);
+    if (s.rowCount === 0) return res.status(404).json({ error: 'siswa tidak ditemukan' });
+    await db.query('INSERT INTO parent_children (parent_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [req.auth.sub, student_id]);
+    res.json({ ok: true, student: s.rows[0] });
+  } catch (err) {
+    console.error('parent/link-child:', err.message);
+    res.status(500).json({ error: 'gagal menghubungkan akun' });
+  }
+});
+
 module.exports = router;
+
+
+
 
 

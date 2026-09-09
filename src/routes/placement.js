@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Placement Test API Endpoints
  * 
  * POST /api/placement/start     - Start placement test (get probe set)
@@ -9,15 +9,7 @@
 const express = require('express');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
-const { Pool } = require('pg');
-
-const pool = new Pool({
-  host: process.env.DB_HOST || 'localhost',
-  port: parseInt(process.env.DB_PORT || '5432'),
-  user: process.env.DB_USER || 'postgres',
-  password: process.env.DB_PASSWORD || 'postgres',
-  database: process.env.DB_NAME || 'cadas_app_dev'
-});
+const db = require('../database/db');
 
 // Target times from SPEED_TARGETS_QUICK_REFERENCE (ms)
 const TARGET_TIMES = {
@@ -39,7 +31,7 @@ router.post('/start', async (req, res) => {
     }
 
     // Check if student already has a completed placement
-    const existing = await pool.query(
+    const existing = await db.query(
       'SELECT * FROM placement_tests WHERE student_id = $1 AND status = $2',
       [studentId, 'completed']
     );
@@ -54,7 +46,7 @@ router.post('/start', async (req, res) => {
 
     // Get a random placement test from the pool
     const startLevel = visualOnly ? 3 : 8;
-    const placementResult = await pool.query(
+    const placementResult = await db.query(
       'SELECT * FROM placement_tests WHERE status = $1 AND start_level = $2 LIMIT 1',
       ['completed', startLevel]
     );
@@ -70,17 +62,17 @@ router.post('/start', async (req, res) => {
       (typeof probesRaw === 'string' ? JSON.parse(probesRaw || '[]') : []);
 
     // Get actual exercise data
-    const exercisesResult = await pool.query(
-      'SELECT id, level, concept_id, num1, num2, operation, correct_answer, problem_text, hint, quick_trick, visualization_type, speech_text FROM exercises WHERE id = ANY($1::text[])',
+    const exercisesResult = await db.query(
+      'SELECT id, source_id, level_id, num1, num2, operation, correct_answer, question_text, hint_text, quick_trick, visualization_type, speech_text FROM exercises WHERE source_id = ANY($1)',
       [exerciseIds]
     );
 
     // Create in-progress placement test for student
     const newPlacementId = uuidv4();
-    await pool.query(`
+    await db.query(`
       INSERT INTO placement_tests (id, student_id, start_level, current_level, probes, status)
       VALUES ($1, $2, $3, $4, $5, 'in_progress')
-    `, [newPlacementId, studentId, placement.start_level, placement.start_level, placement.probes]);
+    `, [newPlacementId, studentId, placement.start_level, placement.start_level, JSON.stringify(exerciseIds)]);
 
     res.json({
       placementId: newPlacementId,
@@ -88,8 +80,8 @@ router.post('/start', async (req, res) => {
       visualOnly,
       exercises: exercisesResult.rows.map(ex => ({
         id: ex.id,
-        level: ex.level,
-        problemText: ex.problem_text,
+        level: ex.level_id,
+        problemText: ex.question_text,
         num1: ex.num1,
         num2: ex.num2,
         operation: ex.operation,
@@ -117,7 +109,7 @@ router.post('/submit', async (req, res) => {
     }
 
     // Get the placement test
-    const placementResult = await pool.query(
+    const placementResult = await db.query(
       'SELECT * FROM placement_tests WHERE id = $1 AND student_id = $2',
       [placementId, studentId]
     );
@@ -133,8 +125,8 @@ router.post('/submit', async (req, res) => {
       (typeof probesRaw === 'string' ? JSON.parse(probesRaw || '[]') : []);
 
     // Get correct answers
-    const exercisesResult = await pool.query(
-      'SELECT id, correct_answer, level, concept_id FROM exercises WHERE id = ANY($1::text[])',
+    const exercisesResult = await db.query(
+      'SELECT id, source_id, level_id, correct_answer FROM exercises WHERE source_id = ANY($1)',
       [exerciseIds]
     );
 
@@ -166,7 +158,7 @@ router.post('/submit', async (req, res) => {
 
     // Save results
     const resultsJson = JSON.stringify(evaluatedAnswers);
-    await pool.query(`
+    await db.query(`
       UPDATE placement_tests
       SET status = 'completed',
           placed_level = $1,
@@ -176,7 +168,7 @@ router.post('/submit', async (req, res) => {
     `, [result.placed_level, resultsJson, placementId]);
 
     // Update student's current level
-    await pool.query(
+    await db.query(
       'UPDATE students SET current_level = $1, trial_level = $2 WHERE id = $3',
       [result.placed_level, result.placed_level, studentId]
     );
@@ -206,8 +198,8 @@ router.get('/status/:studentId', async (req, res) => {
   try {
     const { studentId } = req.params;
 
-    const result = await pool.query(
-      'SELECT id, start_level, placed_level, status, started_at, completed_at FROM placement_tests WHERE student_id = $1 ORDER BY created_at DESC LIMIT 1',
+    const result = await db.query(
+      'SELECT id, start_level, placed_level, status, started_at, completed_at FROM placement_tests WHERE student_id = $1 ORDER BY started_at DESC LIMIT 1',
       [studentId]
     );
 
@@ -329,3 +321,6 @@ function extractSkillArea(conceptId) {
 }
 
 module.exports = router;
+
+
+
