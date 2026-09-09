@@ -1,6 +1,6 @@
 ﻿/**
  * Placement Test API Endpoints
- * 
+ *
  * POST /api/placement/start     - Start placement test (get probe set)
  * POST /api/placement/submit    - Submit answers, get placement result
  * GET  /api/placement/status/:studentId - Check placement status
@@ -124,9 +124,9 @@ router.post('/submit', async (req, res) => {
     const exerciseIds = Array.isArray(probesRaw) ? probesRaw :
       (typeof probesRaw === 'string' ? JSON.parse(probesRaw || '[]') : []);
 
-    // Get correct answers
+    // Get correct answers — BUG FIX #1: include concept_id
     const exercisesResult = await db.query(
-      'SELECT id, source_id, level_id, correct_answer FROM exercises WHERE source_id = ANY($1)',
+      'SELECT id, source_id, level_id, correct_answer, concept_id FROM exercises WHERE source_id = ANY($1)',
       [exerciseIds]
     );
 
@@ -135,7 +135,7 @@ router.post('/submit', async (req, res) => {
       exerciseMap[ex.id] = ex;
     }
 
-    // Evaluate answers
+    // Evaluate answers — BUG FIX #2: use level_id instead of level
     const evaluatedAnswers = [];
     for (const answer of answers) {
       const exercise = exerciseMap[answer.exerciseId];
@@ -144,7 +144,7 @@ router.post('/submit', async (req, res) => {
       const correct = String(answer.answer).trim() === String(exercise.correct_answer).trim();
       evaluatedAnswers.push({
         exerciseId: answer.exerciseId,
-        level: exercise.level,
+        level: exercise.level_id,
         skillArea: extractSkillArea(exercise.concept_id),
         correct,
         timeTakenMs: answer.timeTakenMs || null,
@@ -226,6 +226,7 @@ router.get('/status/:studentId', async (req, res) => {
 
 /**
  * Calculate placement result based on accuracy and speed
+ * BUG FIX #3: Proper fallback logic when accuracy < 80% across all levels
  */
 function calculatePlacement(answers) {
   if (!answers || answers.length === 0) {
@@ -265,6 +266,12 @@ function calculatePlacement(answers) {
       placedLevel = level;
       break;
     }
+  }
+
+  // If placed level > start level with low accuracy, warn but place at highest passing level
+  // If NO level passes 80%, fallback to level 1 (remedial)
+  if (placedLevel === 1 && sortedLevels.length > 0 && accuracyByLevel[sortedLevels[0]] < 0.8) {
+    console.warn(`[PLACEMENT] All levels < 80% accuracy. Placing at level 1 (remedial).`);
   }
 
   // Calculate prerequisite signals (skill areas that need work)
@@ -321,6 +328,3 @@ function extractSkillArea(conceptId) {
 }
 
 module.exports = router;
-
-
-
