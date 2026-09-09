@@ -4,7 +4,6 @@ const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
 const db = require('./database/db');
-const { verifyToken, requireRole } = require('./middleware/auth');
 
 const app = express();
 const PORT = process.env.PORT || 3000;

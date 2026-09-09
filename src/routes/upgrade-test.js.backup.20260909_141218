@@ -52,9 +52,9 @@ router.get('/:level', async (req, res) => {
       return res.status(403).json({
         error: 'PREMIUM_REQUIRED',
         pricing: {
-          singleLevelIdr: 40000,
-          basicBundleIdr: 100000,
-          premiumBundleIdr: 165000,
+          singleLevelIdr: 45000,
+          basicBundleIdr: 120000,
+          premiumBundleIdr: 115000,
           whatsappContact: process.env.ADMIN_WHATSAPP || '6281234567890'
         }
       });
