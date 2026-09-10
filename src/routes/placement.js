@@ -63,7 +63,7 @@ router.post('/start', async (req, res) => {
 
     // Get actual exercise data
     const exercisesResult = await db.query(
-      'SELECT id, source_id, level_id, num1, num2, operation, correct_answer, question_text, hint_text, quick_trick, visualization_type, speech_text FROM exercises WHERE source_id = ANY($1)',
+      `SELECT e.id, e.source_id, e.level_id, e.num1, e.num2, e.operation, e.correct_answer, e.question_text, e.hint_text, e.quick_trick, e.visualization_type, e.speech_text, COALESCE(c.code, 'general') as skill_code FROM exercises e LEFT JOIN concepts c ON e.concept_id = c.id WHERE e.source_id = ANY($1)`,
       [exerciseIds]
     );
 
@@ -126,8 +126,8 @@ router.post('/submit', async (req, res) => {
 
     // Get correct answers — BUG FIX #1: include concept_id
     const exercisesResult = await db.query(
-      'SELECT id, source_id, level_id, correct_answer, concept_id FROM exercises WHERE source_id = ANY($1)',
-      [exerciseIds]
+      `SELECT e.id, e.source_id, e.level_id, e.correct_answer, COALESCE(c.code, 'general') as skill_code FROM exercises e LEFT JOIN concepts c ON e.concept_id = c.id WHERE e.id = ANY($1)`,
+      [answers.map(a => a.exerciseId)]
     );
 
     const exerciseMap = {};
@@ -141,11 +141,11 @@ router.post('/submit', async (req, res) => {
       const exercise = exerciseMap[answer.exerciseId];
       if (!exercise) continue;
 
-      const correct = String(answer.answer).trim() === String(exercise.correct_answer).trim();
+      const correct = parseFloat(answer.answer) === parseFloat(exercise.correct_answer);
       evaluatedAnswers.push({
         exerciseId: answer.exerciseId,
         level: exercise.level_id,
-        skillArea: extractSkillArea(exercise.concept_id),
+        skillArea: exercise.skill_code || 'general',
         correct,
         timeTakenMs: answer.timeTakenMs || null,
         userAnswer: answer.answer,
@@ -156,16 +156,44 @@ router.post('/submit', async (req, res) => {
     // Calculate placement result
     const result = calculatePlacement(evaluatedAnswers);
 
+    // Write student_variant_bias (skills needing remediation)
+    const biasInserts = [];
+    // BUG FIX: correct_count / total_attempts dihitung PER-SKILL dari evaluatedAnswers,
+    // bukan dari agregat seluruh test.
+    for (const skill of Object.keys(result.prerequisite_signals || {})) {
+      const skillAnswers = evaluatedAnswers.filter(a => a.skillArea === skill);
+      if (skillAnswers.length === 0) continue;
+      const correctCount = skillAnswers.filter(a => a.correct).length;
+      const accuracyPercent = Math.round((correctCount / skillAnswers.length) * 100);
+      if (accuracyPercent >= 100) continue; // tidak perlu remediasi
+      biasInserts.push({
+        skill,
+        correctCount,
+        totalAttempts: skillAnswers.length,
+        accuracyPercent
+      });
+    }
+    if (biasInserts.length > 0) {
+      for (const bias of biasInserts) {
+        await db.query(
+          'INSERT INTO student_variant_bias (student_id, placement_id, variant_type, correct_count, total_attempts, accuracy_percent, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW()) ON CONFLICT (student_id, placement_id, variant_type) DO UPDATE SET correct_count = $4, total_attempts = $5, accuracy_percent = $6, updated_at = NOW()',
+          [studentId, placementId, bias.skill, bias.correctCount, bias.totalAttempts, bias.accuracyPercent]
+        );
+      }
+      console.log('[PLACEMENT] Wrote ' + biasInserts.length + ' variant bias records');
+    }
+
     // Save results
     const resultsJson = JSON.stringify(evaluatedAnswers);
     await db.query(`
       UPDATE placement_tests
       SET status = 'completed',
           placed_level = $1,
-          results = $2,
+          prerequisite_signals = $2,
+          results = $3,
           completed_at = NOW()
-      WHERE id = $3
-    `, [result.placed_level, resultsJson, placementId]);
+      WHERE id = $4
+    `, [result.placed_level, JSON.stringify(result.prerequisite_signals), resultsJson, placementId]);
 
     // Update student's current level
     await db.query(
@@ -281,7 +309,8 @@ function calculatePlacement(answers) {
     const correct = items.filter(a => a.correct).length;
     const accuracy = correct / items.length;
 
-    if (accuracy < 0.8 && l <= placedLevel) {
+    const isRemedial = placedLevel === 1 && sortedLevels.length > 0 && accuracyByLevel[sortedLevels[0]] < 0.8;
+    if (accuracy < 0.8 && (l <= placedLevel || isRemedial)) {
       const skillAreas = {};
       for (const item of items) {
         if (!item.correct) {
@@ -290,7 +319,7 @@ function calculatePlacement(answers) {
         }
       }
       for (const [skill, count] of Object.entries(skillAreas)) {
-        prerequisiteSignals[skill] = Math.round((1 - count / items.length) * 100) / 100;
+        prerequisiteSignals[skill] = Math.round((count / items.length) * 100) / 100;
       }
     }
   }

@@ -36,8 +36,8 @@ router.post('/upgrade-tier', verifyToken, requireRole('parent', 'admin'), async 
   } catch (err) { console.error(err.message); res.status(500).json({ error: err.message }); }
 });
 
-// POST /api/admin/billing/activate
-router.post('/admin/billing/activate', async (req, res) => {
+// POST /api/admin/billing/activate  (router di-mount di /api/admin → path internal /billing/activate)
+router.post('/billing/activate', async (req, res) => {
   if (req.headers['x-admin-secret'] !== process.env.ADMIN_SECRET) return res.status(401).json({ error: 'unauthorized' });
   const { student_id, product_type, level_from, level_to, amount_idr, payment_method, proof_note, referrer_code } = req.body || {};
   if (!student_id || !product_type || !level_from || !level_to || !amount_idr) return res.status(400).json({ error: 'field wajib kurang' });
@@ -53,8 +53,8 @@ router.post('/admin/billing/activate', async (req, res) => {
   } catch (err) { console.error(err.message); res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/admin/billing/status/:student_id
-router.get('/admin/billing/status/:student_id', async (req, res) => {
+// GET /api/admin/billing/status/:student_id  (router di-mount di /api/admin)
+router.get('/billing/status/:student_id', async (req, res) => {
   if (req.headers['x-admin-secret'] !== process.env.ADMIN_SECRET) return res.status(401).json({ error: 'unauthorized' });
   try {
     const s = await db.query('SELECT id,display_name,current_level,trial_level,paid_basic_up_to_level,paid_premium_up_to_level FROM students WHERE id = $1', [req.params.student_id]);

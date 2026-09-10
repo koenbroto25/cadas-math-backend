@@ -30,6 +30,8 @@ app.use('/api/upgrade-test', require('./routes/upgrade-test'));
 app.use('/api/rag', require('./routes/rag'));
 app.use('/api/payment', require('./routes/payment'));
 app.use('/api/admin',   require('./routes/payment'));
+// /api/admin/* → payment.js di-mount di /api/payment; /billing/* sudah reachable via /api/payment/billing/*
+// Double-mount dihapus untuk menghindari route conflict.
 
 
 // TTS per-soal: layani cache yang ada (voice migrasi bertahap).
@@ -62,53 +64,6 @@ app.get('/api/health', async (req, res) => {
       database: 'disconnected',
       error: err.message,
     });
-  }
-});
-
-// Helper for Level Access (Addendum v1 Â§1.2)
-function getLevelAccess(student, level) {
-  if (level <= (student.trial_level || 1)) return 'basic';
-  if (level <= (student.paid_premium_up_to_level || 0)) return 'premium';
-  if (level <= (student.paid_basic_up_to_level || 0)) return 'basic';
-  return 'locked';
-}
-
-// Student level access check endpoint stub
-app.get('/api/billing/status/:student_id', verifyToken, requireRole('admin', 'parent'), async (req, res) => {
-  const { student_id } = req.params;
-  try {
-    // Parent hanya boleh lihat data anaknya sendiri
-    if (req.auth.role === 'parent') {
-      const linkCheck = await db.query(
-        'SELECT 1 FROM parent_children WHERE parent_id = $1 AND student_id = $2',
-        [req.auth.sub, student_id]
-      );
-      if (linkCheck.rowCount === 0) {
-        return res.status(403).json({ error: 'akses denied - bukan anak Anda' });
-      }
-    }
-    const result = await db.query(
-      'SELECT id, username, display_name, trial_level, paid_basic_up_to_level, paid_premium_up_to_level, premium_activated_at FROM students WHERE id = $1',
-      [student_id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Student not found' });
-    }
-    const student = result.rows[0];
-    res.json({
-      student_id:                student.id,
-      username:                  student.username,
-      display_name:              student.display_name,
-      trial_level:               student.trial_level || 1,
-      paid_basic_up_to_level:    student.paid_basic_up_to_level || 0,
-      paid_premium_up_to_level:  student.paid_premium_up_to_level || 0,
-      premium_activated_at:      student.premium_activated_at,
-      whatsapp_contact:          process.env.ADMIN_WHATSAPP || '6281234567890',
-    });
-  } catch (err) {
-    console.error('Error fetching billing status:', err);
-    res.status(500).json({ error: err.message });
   }
 });
 

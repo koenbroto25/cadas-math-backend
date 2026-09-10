@@ -7,10 +7,11 @@ const db = require('../database/db');
 
 const router = express.Router();
 
+// FIELDS: tambah concept_id + concept_code untuk Selection Rule (Sprint B item 1)
 const FIELDS = `
-  source_id AS id, level_id AS level, question_text, answer_value,
-  hint_text, quick_trick, speech_text, operation, num1, num2,
-  visualization_type`;
+  e.source_id AS id, e.level_id AS level, e.question_text, e.answer_value,
+  e.hint_text, e.quick_trick, e.speech_text, e.operation, e.num1, e.num2,
+  e.visualization_type, e.concept_id, COALESCE(c.code, 'general') AS concept_code`;
 
 router.get('/:level', async (req, res) => {
   const level = parseInt(req.params.level, 10);
@@ -19,7 +20,7 @@ router.get('/:level', async (req, res) => {
   }
   try {
     const r = await db.query(
-      `SELECT ${FIELDS} FROM exercises WHERE level_id = $1 ORDER BY source_id`,
+      `SELECT ${FIELDS} FROM exercises e LEFT JOIN concepts c ON e.concept_id = c.id WHERE e.level_id = $1 ORDER BY e.source_id`,
       [level]
     );
     res.json({ level, total: r.rowCount, exercises: r.rows });
@@ -32,7 +33,7 @@ router.get('/:level', async (req, res) => {
 router.get('/item/:id', async (req, res) => {
   try {
     const r = await db.query(
-      `SELECT ${FIELDS} FROM exercises WHERE source_id = $1`,
+      `SELECT ${FIELDS} FROM exercises e LEFT JOIN concepts c ON e.concept_id = c.id WHERE e.source_id = $1`,
       [req.params.id]
     );
     if (r.rowCount === 0) {

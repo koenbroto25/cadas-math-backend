@@ -27,17 +27,42 @@ async function lexicalSearch(question, level, conceptId) {
     }
   }
 
+  // pg_trgm TIDAK terpasang di DB aktual (Sprint B) — pakai ILIKE + scoring JS.
+  // Teks skenario ada di kolom JSON `variants` (gasing/pmri/quick), bukan hanya di
+  // `content` (main explanation) — jadi keduanya ikut dicari.
   const fuzzy = await db.query(
-    `SELECT id, concept_id, level_id, content, audio_url, viseme_json,
-            similarity(content, $1) AS sim
+    `SELECT id, concept_id, level_id, content, audio_url, viseme_json, variants
      FROM explanations
-     WHERE level_id = $2 AND content ILIKE $3
-     ORDER BY sim DESC LIMIT 5`,
-    [normalizedQ, level, `%${normalizedQ}%`]
+     WHERE level_id = $1 AND (content ILIKE $2 OR variants::text ILIKE $2)
+     ORDER BY created_at DESC LIMIT 20`,
+    [level, `%${normalizedQ}%`]
   );
 
-  if (fuzzy.rows.length > 0 && fuzzy.rows[0].sim > 0.3) {
-    return { hit: 'strong', source: 'lexical', results: fuzzy.rows };
+  // Scoring JS: rasio kata pertanyaan (>=3 huruf) yang muncul di konten,
+  // dievaluasi terhadap content DAN setiap varian di kolom variants.
+  const words = normalizedQ.split(/\s+/).filter(w => w.length >= 3);
+  let best = null, bestRatio = 0, bestText = null;
+  for (const row of fuzzy.rows) {
+    const candidates = [{ text: row.content, style: 'main' }];
+    if (row.variants) {
+      try {
+        const arr = typeof row.variants === 'string' ? JSON.parse(row.variants) : row.variants;
+        (arr || []).forEach((v, i) => {
+          if (v && v.content) candidates.push({ text: v.content, style: v.explanation_style || ('variant_' + i) });
+        });
+      } catch (e) { /* variants rusak — lewati */ }
+    }
+    for (const c of candidates) {
+      const lower = c.text.toLowerCase();
+      const matched = words.filter(w => lower.includes(w)).length;
+      const ratio = words.length > 0 ? matched / words.length : 0;
+      if (ratio > bestRatio) { bestRatio = ratio; best = row; bestText = c.text; }
+    }
+  }
+
+  if (best && bestRatio >= 0.6) {
+    best.matchedText = bestText;
+    return { hit: 'strong', source: 'lexical', results: [best], similarity: bestRatio };
   }
 
   return { hit: 'weak', source: 'lexical', results: fuzzy.rows };
@@ -46,7 +71,10 @@ async function lexicalSearch(question, level, conceptId) {
 // ============================================================
 // Layer 2: Semantic Search
 // ============================================================
-async function semanticSearch(question, level, conceptId, threshold = 0.6) {
+async function semanticSearch(question, level, conceptId, threshold = 0.20) {
+  // Threshold dikalibrasi untuk hashing-trick embedder (Sprint B):
+  // pertanyaan terkait ~0.28-0.50, tidak terkait ~0.03-0.06.
+  // Revisit saat mengganti ke model embedder nyata.
   try {
     const vectorCheck = await db.query(
       "SELECT extname FROM pg_extension WHERE extname = 'vector'"
@@ -73,7 +101,7 @@ async function semanticSearch(question, level, conceptId, threshold = 0.6) {
     }
 
     const topSim = semantic.rows[0].similarity;
-    if (topSim >= 0.85) {
+    if (topSim >= 0.25) {
       return { hit: 'strong', source: 'semantic', results: semantic.rows, similarity: topSim };
     } else if (topSim >= threshold) {
       return { hit: 'partial', source: 'semantic', results: semantic.rows, similarity: topSim };
@@ -92,13 +120,14 @@ async function openRouterFallback(question, level, conceptId, fewShotContext, st
     return { hit: 'none', source: 'openrouter', reason: 'OpenRouter not configured' };
   }
 
+  // Skema aktual student_level_quota: current_level, attempted_today, daily_limit. Sprint B.
   const quota = await db.query(
-    `SELECT llm_calls_used, llm_calls_limit FROM student_level_quota
-     WHERE student_id = $1 AND level = $2`,
+    `SELECT attempted_today, daily_limit FROM student_level_quota
+     WHERE student_id = $1 AND current_level = $2`,
     [studentId, level]
   );
 
-  if (quota.rows.length > 0 && quota.rows[0].llm_calls_used >= quota.rows[0].llm_calls_limit) {
+  if (quota.rows.length > 0 && quota.rows[0].attempted_today >= quota.rows[0].daily_limit) {
     return { hit: 'none', source: 'openrouter', reason: 'Quota exceeded' };
   }
 
@@ -111,19 +140,26 @@ async function openRouterFallback(question, level, conceptId, fewShotContext, st
       maxTokens: 512,
     });
 
+    // ON CONFLICT pakai unique key aktual: (student_id, current_level). Sprint B.
     await db.query(
-      `INSERT INTO student_level_quota (student_id, level, llm_calls_used, quota_reset_at)
-       VALUES ($1, $2, 1, NOW() + INTERVAL '30 days')
-       ON CONFLICT (student_id, level)
-       DO UPDATE SET llm_calls_used = student_level_quota.llm_calls_used + 1`,
+      `INSERT INTO student_level_quota (student_id, current_level, attempted_today, daily_limit, is_premium)
+       VALUES ($1, $2, 1, 40, true)
+       ON CONFLICT (student_id, current_level)
+       DO UPDATE SET attempted_today = student_level_quota.attempted_today + 1`,
       [studentId, level]
     );
 
-    await db.query(
-      `INSERT INTO openrouter_cost_log (student_id, level, cost_usd, tokens_used, model, success)
-       VALUES ($1, $2, $3, $4, $5, true)`,
-      [studentId, level, 0, result.usage?.total_tokens || 0, result.model]
-    );
+    // Tabel openrouter_cost_log TIDAK ADA di DB aktual — pakai llm_usage_log
+    // (kolom: student_id, level_id, model, estimated_cost_usd). Sprint B.
+    try {
+      await db.query(
+        `INSERT INTO llm_usage_log (student_id, level_id, model, estimated_cost_usd)
+         VALUES ($1, $2, $3, 0)`,
+        [studentId, level, result.model]
+      );
+    } catch (logErr) {
+      console.warn('[RAG] llm_usage_log insert failed:', logErr.message);
+    }
 
     return { hit: 'strong', source: 'openrouter', text: result.text, model: result.model };
   } catch (err) {
@@ -185,18 +221,19 @@ async function generateOutput(text, level, accessType, conceptId) {
 async function askKak({ studentId, questionText, conceptId, level, accessType }) {
   const questionHash = crypto.createHash('sha256').update(questionText.toLowerCase().trim()).digest('hex');
 
-  // Check cache first
+  // Skema aktual student_questions: TIDAK ada kolom question_hash —
+  // cache via exact-match pertanyaan (case-insensitive). Sprint B.
   const cached = await db.query(
-    `SELECT answer_text, audio_url, source FROM student_questions
-     WHERE student_id = $1 AND question_hash = $2
+    `SELECT answer_text, source FROM student_questions
+     WHERE student_id = $1 AND LOWER(question_text) = LOWER($2)
      ORDER BY created_at DESC LIMIT 1`,
-    [studentId, questionHash]
+    [studentId, questionText]
   );
 
   if (cached.rows.length > 0) {
     return {
       answer: cached.rows[0].answer_text,
-      audioUrl: cached.rows[0].audio_url,
+      audioUrl: null,
       source: cached.rows[0].source,
       cached: true,
     };
@@ -209,7 +246,7 @@ async function askKak({ studentId, questionText, conceptId, level, accessType })
   // Step 1: Lexical Search
   const lexical = await lexicalSearch(questionText, level, conceptId);
   if (lexical.hit === 'strong') {
-    answerText = lexical.results[0].content;
+    answerText = lexical.results[0].matchedText || lexical.results[0].content;
     source = 'lexical';
   }
 
@@ -264,10 +301,17 @@ async function askKak({ studentId, questionText, conceptId, level, accessType })
 // Helper Functions
 // ============================================================
 async function cacheQuestion(studentId, questionText, questionHash, conceptId, level, source, answerText, audioUrl, isPremium) {
+  // Skema aktual student_questions: student_id, level_id, question_text,
+  // answer_text, source, llm_model, response_time_ms, was_helpful. Sprint B.
+  // CHECK constraint: source hanya boleh 'lexical'|'semantic'|'openrouter' —
+  // jawaban generik (none/fallback) tidak di-cache.
+  if (!['lexical', 'semantic', 'openrouter'].includes(source)) {
+    return;
+  }
   await db.query(
-    `INSERT INTO student_questions (student_id, question_text, question_hash, concept_id, level, source, answer_text, audio_url, is_premium)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-    [studentId, questionText, questionHash, conceptId, level, source, answerText, audioUrl, isPremium]
+    `INSERT INTO student_questions (student_id, level_id, question_text, answer_text, source, was_helpful)
+     VALUES ($1, $2, $3, $4, $5, false)`,
+    [studentId, level, questionText, answerText, source]
   );
 }
 
@@ -289,15 +333,25 @@ Aturan:
 }
 
 async function generateEmbedding(text) {
-  // Placeholder: hash-based pseudo-embedding for MVP
-  // Replace with real embedding model (e.g., transformers.js) in production
-  const hash = crypto.createHash('md5').update(text.toLowerCase()).digest();
-  const embedding = new Array(384).fill(0);
-  for (let i = 0; i < hash.length; i++) {
-    embedding[i % 384] = (hash[i] / 255) * 2 - 1;
+  // Hashing-trick embedding (MVP placeholder) — Sprint B:
+  // bag-of-words per token ke 384 dim (kolom DB aktual: vector(384)), 3 hash
+  // functions per token, L2-normalize. Teks yang berbagi kosakata menghasilkan
+  // cosine similarity tinggi, jadi layer semantic benar-benar berfungsi.
+  // Ganti dengan model embedder nyata (transformers.js / Gemini embedding)
+  // di produksi — ukuran vektor harus tetap 384 atau migrasi kolom.
+  const DIM = 384;
+  const vec = new Array(DIM).fill(0);
+  const tokens = String(text || '').toLowerCase().match(/[a-z0-9\u00C0-\u024F]+/g) || [];
+  for (const tok of tokens) {
+    for (let k = 0; k < 3; k++) {
+      const h = crypto.createHash('md5').update(tok + '#' + k).digest();
+      const idx = ((h[0] << 8) | h[1]) % DIM;
+      const sign = (h[2] & 1) === 0 ? 1 : -1;
+      vec[idx] += sign;
+    }
   }
-  const norm = Math.sqrt(embedding.reduce((s, v) => s + v * v, 0));
-  return embedding.map(v => v / (norm || 1));
+  const norm = Math.sqrt(vec.reduce((s, v) => s + v * v, 0));
+  return norm > 0 ? vec.map(v => v / norm) : vec;
 }
 
 module.exports = {
@@ -307,4 +361,5 @@ module.exports = {
   openRouterFallback,
   normalizeOutput,
   generateOutput,
+  generateEmbedding,
 };

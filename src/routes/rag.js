@@ -1,25 +1,17 @@
-/**
- * RAG API Endpoints — FASE 8
+﻿/**
+ * RAG API Endpoints â€” FASE 8
  *
- * POST /api/rag/ask           — Main AskKak pipeline
- * GET  /api/rag/select-variant — Selection Rule for PracticeScreen
- * GET  /api/rag/quota/:studentId — Check remaining quota
+ * POST /api/rag/ask           â€” Main AskKak pipeline
+ * GET  /api/rag/select-variant â€” Selection Rule for PracticeScreen
+ * GET  /api/rag/quota/:studentId â€” Check remaining quota
  */
 
 const express = require('express');
 const router = express.Router();
-const { Pool } = require('pg');
+const db = require('../database/db'); // shared pool â€” fix duplikasi koneksi (Sprint B)
 const { askKak, normalizeOutput } = require('../rag/pipeline');
 const { selectExplanationVariant, recordVariantShown, recordVariantHelpful } = require('../rag/selection-rule');
 const { getLevelAccess } = require('../middleware/level-access');
-
-const pool = new Pool({
-  host: process.env.DB_HOST || 'localhost',
-  port: parseInt(process.env.DB_PORT || '5432'),
-  user: process.env.DB_USER || 'postgres',
-  password: process.env.DB_PASSWORD || 'postgres',
-  database: process.env.DB_NAME || 'cadas_app_dev',
-});
 
 /**
  * POST /api/rag/ask
@@ -34,7 +26,7 @@ router.post('/ask', async (req, res) => {
       return res.status(400).json({ error: 'student_id, question_text, and level are required' });
     }
 
-    const access = await getLevelAccess(pool, student_id, level);
+    const access = await getLevelAccess(db, student_id, level);
     if (access === 'locked') {
       return res.status(403).json({
         error: 'PREMIUM_REQUIRED',
@@ -62,9 +54,9 @@ router.post('/ask', async (req, res) => {
  * GET /api/rag/select-variant
  * Selection Rule endpoint for PracticeScreen.
  */
-router.get('/select-variant', async (req, res) => {
+router.post('/select-variant', async (req, res) => {
   try {
-    const { student_id, level, concept_id, attempt_number, accuracy, avg_time_ms, target_time_ms } = req.query;
+    const { student_id, level, concept_id, attempt_number, accuracy, avg_time_ms, target_time_ms } = req.body;
 
     if (!student_id || !level) {
       return res.status(400).json({ error: 'student_id and level are required' });
@@ -144,10 +136,12 @@ router.get('/quota/:studentId', async (req, res) => {
       return res.status(400).json({ error: 'level query parameter is required' });
     }
 
-    const quota = await pool.query(
-      `SELECT llm_calls_used, llm_calls_limit, quota_reset_at
+    // Skema aktual student_level_quota: current_level, attempted_today,
+    // daily_limit, reset_date. Sprint B.
+    const quota = await db.query(
+      `SELECT attempted_today, daily_limit, reset_date
        FROM student_level_quota
-       WHERE student_id = $1 AND level = $2`,
+       WHERE student_id = $1 AND current_level = $2`,
       [studentId, parseInt(level, 10)]
     );
 
@@ -165,10 +159,10 @@ router.get('/quota/:studentId', async (req, res) => {
     res.json({
       student_id: studentId,
       level: parseInt(level, 10),
-      llm_calls_used: q.llm_calls_used,
-      llm_calls_limit: q.llm_calls_limit,
-      remaining: Math.max(0, q.llm_calls_limit - q.llm_calls_used),
-      quota_reset_at: q.quota_reset_at,
+      llm_calls_used: q.attempted_today,
+      llm_calls_limit: q.daily_limit,
+      remaining: Math.max(0, q.daily_limit - q.attempted_today),
+      quota_reset_at: q.reset_date,
     });
   } catch (error) {
     console.error('Quota check error:', error);
@@ -196,3 +190,5 @@ router.post('/normalize', async (req, res) => {
 });
 
 module.exports = router;
+
+

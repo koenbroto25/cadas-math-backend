@@ -5,28 +5,10 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../database/db');
-
-/**
- * Helper: Get level access based on Addendum v1 Â§1.2
- */
-async function getLevelAccess(studentId, level) {
-  const result = await db.query(
-    'SELECT trial_level, paid_basic_up_to_level, paid_premium_up_to_level FROM students WHERE id = $1',
-    [studentId]
-  );
-  
-  if (result.rows.length === 0) return 'locked';
-  const student = result.rows[0];
-
-  const trialLimit = student.trial_level || 3;
-  const basicLimit = student.paid_basic_up_to_level || 0;
-  const premiumLimit = student.paid_premium_up_to_level || 0;
-
-  if (level <= trialLimit) return 'basic';
-  if (level <= premiumLimit) return 'premium';
-  if (level <= basicLimit) return 'basic';
-  return 'locked';
-}
+// Pakai shared Level Access (middleware) — Sprint C:
+// trial_level BUKAN gerbang akses (final_plan OVERRIDE / keputusan desain).
+// Akses hanya dari paid_basic / paid_premium, konsisten dgn rag.js.
+const { getLevelAccess } = require('../middleware/level-access');
 
 /**
  * GET /api/upgrade-test/:level
@@ -39,7 +21,7 @@ router.get('/:level', async (req, res) => {
     if (!studentId) return res.status(400).json({ error: 'studentId required' });
     if (isNaN(level)) return res.status(400).json({ error: 'Invalid level' });
 
-    const access = await getLevelAccess(studentId, level);
+    const access = await getLevelAccess(db, studentId, level);
     if (access === 'locked') {
       return res.status(403).json({
         error: 'PREMIUM_REQUIRED',

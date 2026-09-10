@@ -46,16 +46,9 @@ function checkLevelAccess(paramName = 'level') {
         return res.status(400).json({ error: 'student_id and level are required' });
       }
 
-      const { Pool } = require('pg');
-      const pool = new Pool({
-        host: process.env.DB_HOST || 'localhost',
-        port: parseInt(process.env.DB_PORT || '5432'),
-        user: process.env.DB_USER || 'postgres',
-        password: process.env.DB_PASSWORD || 'postgres',
-        database: process.env.DB_NAME || 'cadas_app_dev',
-      });
-
-      req.levelAccess = await getLevelAccess(pool, studentId, level);
+      // Pakai shared db — fix duplikasi koneksi (Sprint B, konsisten dengan Fase 7).
+      const db = require('../database/db');
+      req.levelAccess = await getLevelAccess(db, studentId, level);
       req.level = parseInt(level, 10);
       next();
     } catch (error) {
