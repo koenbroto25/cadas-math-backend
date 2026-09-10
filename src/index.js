@@ -28,6 +28,7 @@ app.use('/api/rag',         require('./routes/rag'));
 app.use('/api/payment',     require('./routes/payment'));
 app.use('/api/admin',       require('./routes/admin'));    // Sprint D.4 - admin dashboard
 app.use('/api/referrer',    require('./routes/referrer')); // Sprint D.3+D.5 - referrer auth+dashboard
+app.use('/api/parent',    require('./routes/parent'));  // Sprint E
 app.use('/api/xendit',      require('./routes/xendit'));   // Sprint D.2 - xendit gateway
 
 // Sprint D.6 - /d/:token redirect (download link tracker)
@@ -100,3 +101,4 @@ app.listen(PORT, () => {
 });
 
 module.exports = app;
+
