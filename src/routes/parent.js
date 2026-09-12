@@ -1,4 +1,4 @@
-﻿/**
+/**
  * routes/parent.js - Sprint E
  * Parent Dashboard Routes (dilindungi JWT role parent)
  *
@@ -163,10 +163,10 @@ router.get('/child/:student_id/billing', async (req, res) => {
       ORDER BY created_at DESC LIMIT 10
     `, [req.params.student_id]);
 
-    const xendit = await db.query(`
+    const midtrans = await db.query(`
       SELECT product_type, level_from, level_to, amount_idr,
              status, paid_at, created_at
-      FROM xendit_invoices
+      FROM midtrans_invoices
       WHERE student_id = $1
       ORDER BY created_at DESC LIMIT 10
     `, [req.params.student_id]);
@@ -174,7 +174,7 @@ router.get('/child/:student_id/billing', async (req, res) => {
     res.json({
       student:         s.rows[0],
       payment_records: payments.rows,
-      xendit_invoices: xendit.rows,
+      midtrans_invoices: midtrans.rows,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });

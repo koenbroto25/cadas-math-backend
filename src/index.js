@@ -29,7 +29,7 @@ app.use('/api/admin',        require('./routes/admin'));       // Sprint D.4 - a
 app.use('/api/referrer',     require('./routes/referrer'));    // Sprint D.3+D.5 - referrer auth+dashboard
 app.use('/api/teacher',      require('./routes/teacher'));     // Sprint F
 app.use('/api/parent',       require('./routes/parent'));      // Sprint E
-app.use('/api/xendit',       require('./routes/xendit'));      // Sprint D.2 - xendit gateway
+app.use('/api/midtrans',    require('./routes/midtrans'));   // Sprint D.2 - midtrans gateway
 
 // Sprint D.6 - /d/:token redirect (download link tracker)
 app.get('/d/:token', async (req, res) => {
