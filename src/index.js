@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
@@ -69,15 +69,37 @@ app.get('/d/:token', async (req, res) => {
   res.redirect(302, STORE_URL);
 });
 
-// TTS per-soal cache
+// TTS per-soal cache + Viseme + Bot Audio — Sprint H.4
+// Primary: redirect ke R2 Opus; Fallback: lokal WAV
+const R2_URL = process.env.R2_PUBLIC_URL || '';
 app.get('/api/tts/:id', (req, res) => {
   const type = ['hint', 'trick'].includes(req.query.type) ? req.query.type : 'hint';
   if (!/^[A-Za-z0-9_\-]+$/.test(req.params.id)) {
     return res.status(400).json({ error: 'id tidak valid' });
   }
-  const file = path.join(SPEED_MASTER, 'audio', 'speech', 'cache', `${req.params.id}_${type}.wav`);
+  if (R2_URL) return res.redirect(302, R2_URL + '/speech/cache/opus/' + req.params.id + '_' + type + '.opus');
+  const file = path.join(SPEED_MASTER, 'audio', 'speech', 'cache', req.params.id + '_' + type + '.wav');
   if (fs.existsSync(file)) return res.sendFile(file);
-  res.status(404).json({ error: 'audio belum tersedia (fallback teks di app)' });
+  res.status(404).json({ error: 'audio belum tersedia' });
+});
+
+app.get('/api/viseme/:id', (req, res) => {
+  const type = ['hint', 'trick'].includes(req.query.type) ? req.query.type : 'hint';
+  if (!/^[A-Za-z0-9_\-]+$/.test(req.params.id)) {
+    return res.status(400).json({ error: 'id tidak valid' });
+  }
+  if (R2_URL) return res.redirect(302, R2_URL + '/speech/cache/visemes/' + req.params.id + '_' + type + '.json');
+  const file = path.join(SPEED_MASTER, 'audio', 'speech', 'cache', 'visemes', req.params.id + '_' + type + '.json');
+  if (fs.existsSync(file)) return res.sendFile(file);
+  res.status(404).json({ error: 'viseme belum tersedia' });
+});
+
+app.get('/api/bot-audio/:file', (req, res) => {
+  if (!/^[A-Za-z0-9_\-]+$/.test(req.params.file)) {
+    return res.status(400).json({ error: 'file tidak valid' });
+  }
+  if (R2_URL) return res.redirect(302, R2_URL + '/bot/speech/opus/' + req.params.file + '.opus');
+  res.status(404).json({ error: 'bot audio tidak tersedia' });
 });
 
 // Health check
