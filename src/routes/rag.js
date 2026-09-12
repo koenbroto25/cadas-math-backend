@@ -1,9 +1,13 @@
 ﻿/**
- * RAG API Endpoints â€” FASE 8
+ * RAG API Endpoints — FASE 8
  *
- * POST /api/rag/ask           â€” Main AskKak pipeline
- * GET  /api/rag/select-variant â€” Selection Rule for PracticeScreen
- * GET  /api/rag/quota/:studentId â€” Check remaining quota
+ * POST /api/rag/ask              — Main AskKak pipeline
+ * POST /api/rag/select-variant   — Selection Rule for PracticeScreen
+ * POST /api/rag/record-shown     — Track variant shown
+ * POST /api/rag/record-helpful   — Track variant helpful
+ * GET  /api/rag/quota/:studentId — Check remaining quota
+ * GET  /api/rag/level-voice/:level — Audio + viseme per level (Sprint G.1)
+ * POST /api/rag/normalize        — Utility text normalization
  */
 
 const express = require('express');
@@ -51,8 +55,9 @@ router.post('/ask', async (req, res) => {
 });
 
 /**
- * GET /api/rag/select-variant
+ * POST /api/rag/select-variant
  * Selection Rule endpoint for PracticeScreen.
+ * Body: { student_id, level, concept_id, attempt_number?, accuracy?, avg_time_ms?, target_time_ms? }
  */
 router.post('/select-variant', async (req, res) => {
   try {
@@ -185,6 +190,45 @@ router.post('/normalize', async (req, res) => {
     res.json({ original: text, normalized });
   } catch (error) {
     console.error('Normalize error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/rag/level-voice/:level
+ * Sprint G.1 — audio + viseme Rhubarb per level untuk lip-sync Kak Cadas.
+ * Sumber: level_audio_segments (120 pasang pre-generated, format mouthCues).
+ * Response: { level, segments: [{ segment, spoken_text, audio_url, visemes }] }
+ */
+router.get('/level-voice/:level', async (req, res) => {
+  try {
+    const level = parseInt(req.params.level, 10);
+    if (!level || level < 1) {
+      return res.status(400).json({ error: 'level tidak valid' });
+    }
+
+    const rows = await db.query(
+      `SELECT segment, spoken_text, audio_url, viseme_json
+       FROM level_audio_segments
+       WHERE level_id = $1 AND audio_url IS NOT NULL
+       ORDER BY CASE
+         WHEN segment = 'main' THEN 0
+         WHEN segment = 'quick' THEN 1
+         ELSE 2 END, id`,
+      [level]
+    );
+
+    res.json({
+      level,
+      segments: rows.rows.map((r) => ({
+        segment: r.segment,
+        spoken_text: r.spoken_text,
+        audio_url: r.audio_url,
+        visemes: r.viseme_json || null,
+      })),
+    });
+  } catch (error) {
+    console.error('Level voice error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

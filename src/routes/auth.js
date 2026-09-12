@@ -1,32 +1,26 @@
 ﻿/**
- * FASE 3.1 â€” Auth: register/login 3 role + Parent Gate.
- *
- * Urutan onboarding mengikuti [ADD] Â§6.2 (OVERRIDE): siswa daftar TANPA
- * registrasi orang tua â€” orang tua baru daftar SETELAH placement (FASE 4).
- * Maka: student/register hanya bikin profil anak, TANPA email/password.
+ * FASE 3.1 - Auth: register/login 3 role + Parent Gate.
  */
 const express = require('express');
-const bcrypt = require('bcryptjs');
-const crypto = require('crypto');
-const db = require('../database/db');
+const bcrypt  = require('bcryptjs');
+const crypto  = require('crypto');
+const jwt     = require('jsonwebtoken');
+const db      = require('../database/db');
 const { signToken, verifyToken, requireRole } = require('../middleware/auth');
 
-const router = express.Router();
+const router       = express.Router();
 const BCRYPT_ROUNDS = 10;
+const SECRET       = process.env.JWT_SECRET || 'cadas_app_secure_secret_key_2026';
 
-// â”€â”€ STUDENT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// -- STUDENT --------------------------------------------------------------
 // POST /api/auth/student/register  { name, kelas }
-// â†’ 200 { student_id } â€” TIDAK minta email/password (urutan [ADD] Â§6.2)
 router.post('/student/register', async (req, res) => {
   const { name, kelas } = req.body || {};
-  if (!name || typeof name !== 'string' || name.trim().length < 2) {
+  if (!name || typeof name !== 'string' || name.trim().length < 2)
     return res.status(400).json({ error: 'name wajib diisi (min 2 karakter)' });
-  }
   const grade = parseInt(kelas, 10);
-  if (!Number.isInteger(grade) || grade < 1 || grade > 9) {
-    return res.status(400).json({ error: 'kelas harus angka 1-9 (SMP ke atas)' });
-  }
-
+  if (!Number.isInteger(grade) || grade < 1 || grade > 9)
+    return res.status(400).json({ error: 'kelas harus angka 1-9' });
   try {
     const username = `siswa_${crypto.randomBytes(4).toString('hex')}`;
     const r = await db.query(
@@ -36,7 +30,6 @@ router.post('/student/register', async (req, res) => {
       [username, name.trim(), grade]
     );
     const student = r.rows[0];
-    // Token siswa: untuk identitas device-profile (tanpa login mandiri, V3 Â§5.3)
     res.status(201).json({
       student_id: student.id,
       student,
@@ -48,20 +41,37 @@ router.post('/student/register', async (req, res) => {
   }
 });
 
-// â”€â”€ PARENT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// POST /api/auth/student/login  { student_id }
+router.post('/student/login', async (req, res) => {
+  const { student_id } = req.body || {};
+  if (!student_id || typeof student_id !== 'string')
+    return res.status(400).json({ error: 'student_id wajib diisi' });
+  try {
+    const r = await db.query(
+      `SELECT id, username, display_name AS name, grade_level AS kelas,
+              current_level, trial_level, paid_basic_up_to_level, paid_premium_up_to_level
+       FROM students WHERE id = $1`,
+      [student_id]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'siswa tidak ditemukan' });
+    const student = r.rows[0];
+    res.json({ student_id: student.id, student, token: signToken({ sub: student.id, role: 'student' }) });
+  } catch (err) {
+    console.error('student/login:', err.message);
+    res.status(500).json({ error: 'gagal login' });
+  }
+});
+
+// -- PARENT ---------------------------------------------------------------
 // POST /api/auth/parent/register  { name, email?, phone?, password }
 router.post('/parent/register', async (req, res) => {
   const { name, email, phone, password } = req.body || {};
-  if (!name || typeof name !== 'string' || name.trim().length < 2) {
+  if (!name || typeof name !== 'string' || name.trim().length < 2)
     return res.status(400).json({ error: 'name wajib diisi' });
-  }
-  if (!email && !phone) {
+  if (!email && !phone)
     return res.status(400).json({ error: 'email atau phone wajib diisi salah satu' });
-  }
-  if (!password || typeof password !== 'string' || password.length < 6) {
+  if (!password || typeof password !== 'string' || password.length < 6)
     return res.status(400).json({ error: 'password wajib diisi (min 6 karakter)' });
-  }
-
   try {
     const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
     const r = await db.query(
@@ -77,32 +87,30 @@ router.post('/parent/register', async (req, res) => {
       token: signToken({ sub: parent.id, role: 'parent' }),
     });
   } catch (err) {
-    if (String(err.message).includes('uq_parents_email') || String(err.message).includes('parents_phone_key')) {
+    if (String(err.message).includes('uq_parents_email') || String(err.message).includes('parents_phone_key'))
       return res.status(409).json({ error: 'email/phone sudah terdaftar' });
-    }
     console.error('parent/register:', err.message);
     res.status(500).json({ error: 'gagal mendaftarkan parent' });
   }
 });
 
-// POST /api/auth/parent/login  { email? , phone?, password }
+// POST /api/auth/parent/login  { email?, phone?, password }
 router.post('/parent/login', async (req, res) => {
   const { email, phone, password } = req.body || {};
-  if ((!email && !phone) || !password) {
+  if ((!email && !phone) || !password)
     return res.status(400).json({ error: 'email/phone + password wajib diisi' });
-  }
   try {
     const r = await db.query(
-      'SELECT id, display_name, password_hash FROM parents WHERE email = $1 OR phone = $1',
+      `SELECT id, display_name, password_hash FROM parents
+       WHERE email = $1 OR phone = $1`,
       [email || phone]
     );
     if (r.rowCount === 0) return res.status(401).json({ error: 'kredensial salah' });
     const ok = await bcrypt.compare(password, r.rows[0].password_hash || '');
     if (!ok) return res.status(401).json({ error: 'kredensial salah' });
-
     res.json({
       parent_id: r.rows[0].id,
-      name: r.rows[0].display_name,
+      parent: { id: r.rows[0].id, display_name: r.rows[0].display_name },
       token: signToken({ sub: r.rows[0].id, role: 'parent' }),
     });
   } catch (err) {
@@ -111,19 +119,36 @@ router.post('/parent/login', async (req, res) => {
   }
 });
 
-// â”€â”€ TEACHER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// POST /api/auth/parent/link-child  { student_id }
+router.post('/parent/link-child', verifyToken, requireRole('parent'), async (req, res) => {
+  const { student_id } = req.body || {};
+  if (!student_id) return res.status(400).json({ error: 'student_id wajib diisi' });
+  try {
+    const s = await db.query(
+      'SELECT id, display_name, current_level, trial_level FROM students WHERE id = $1',
+      [student_id]
+    );
+    if (s.rowCount === 0) return res.status(404).json({ error: 'siswa tidak ditemukan' });
+    await db.query(
+      'INSERT INTO parent_children (parent_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [req.auth.sub, student_id]
+    );
+    res.json({ ok: true, student: s.rows[0] });
+  } catch (err) {
+    console.error('parent/link-child:', err.message);
+    res.status(500).json({ error: 'gagal menghubungkan akun' });
+  }
+});
+
+// -- TEACHER --------------------------------------------------------------
 // POST /api/auth/teacher/register  { name, email, password, teacher_type }
-// teacher_type: 'school' (classroom gratis, 0% komisi) | 'private' (referral+komisi)
 router.post('/teacher/register', async (req, res) => {
   const { name, email, password, teacher_type } = req.body || {};
   if (!name || !email) return res.status(400).json({ error: 'name + email wajib diisi' });
-  if (!password || password.length < 6) {
+  if (!password || password.length < 6)
     return res.status(400).json({ error: 'password wajib diisi (min 6 karakter)' });
-  }
-  if (!['school', 'private'].includes(teacher_type)) {
+  if (!['school', 'private'].includes(teacher_type))
     return res.status(400).json({ error: "teacher_type harus 'school' atau 'private'" });
-  }
-
   try {
     const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
     const r = await db.query(
@@ -133,7 +158,6 @@ router.post('/teacher/register', async (req, res) => {
       [email.toLowerCase(), name.trim(), teacher_type, hash]
     );
     const teacher = r.rows[0];
-    // Guru baru BELUM verified â€” tidak bisa bikin classroom/referral sampai FASE 11 approval
     res.status(201).json({
       teacher_id: teacher.id,
       teacher,
@@ -141,9 +165,8 @@ router.post('/teacher/register', async (req, res) => {
       token: signToken({ sub: teacher.id, role: 'teacher', verified: false }),
     });
   } catch (err) {
-    if (String(err.message).includes('teachers_email_key') || String(err.message).includes('duplicate')) {
+    if (String(err.message).includes('teachers_email_key') || String(err.message).includes('duplicate'))
       return res.status(409).json({ error: 'email sudah terdaftar' });
-    }
     console.error('teacher/register:', err.message);
     res.status(500).json({ error: 'gagal mendaftarkan guru' });
   }
@@ -155,19 +178,26 @@ router.post('/teacher/login', async (req, res) => {
   if (!email || !password) return res.status(400).json({ error: 'email + password wajib' });
   try {
     const r = await db.query(
-      'SELECT id, display_name, teacher_type, is_verified, password_hash FROM teachers WHERE email = $1',
+      `SELECT id, display_name, teacher_type, is_verified, password_hash
+       FROM teachers WHERE email = $1`,
       [String(email).toLowerCase()]
     );
     if (r.rowCount === 0) return res.status(401).json({ error: 'kredensial salah' });
-    const t = r.rows[0];
+    const t  = r.rows[0];
     const ok = await bcrypt.compare(password, t.password_hash || '');
     if (!ok) return res.status(401).json({ error: 'kredensial salah' });
-
     res.json({
-      teacher_id: t.id,
-      name: t.display_name,
+      teacher_id:   t.id,
+      teacher: {
+        id:          t.id,
+        display_name: t.display_name,
+        teacher_type: t.teacher_type,
+        verified:    t.is_verified,
+      },
+      display_name: t.display_name,
+      name:         t.display_name,
       teacher_type: t.teacher_type,
-      verified: t.is_verified,
+      verified:     t.is_verified,
       token: signToken({ sub: t.id, role: 'teacher', verified: t.is_verified }),
     });
   } catch (err) {
@@ -176,89 +206,53 @@ router.post('/teacher/login', async (req, res) => {
   }
 });
 
-// â”€â”€ PARENT GATE ([V3] Â§5.2) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// Soal perkalian sederhana sebelum masuk area Parent/Guru dari sesi anak.
-// Challenge stateless: jawaban ditandatangani ke dalam token ber-TTL 2 menit.
-// GET /api/auth/parent-gate/challenge â†’ { challenge_token, question }
-const jwt = require('jsonwebtoken');
-const SECRET = process.env.JWT_SECRET || 'cadas_app_secure_secret_key_2026';
+// POST /api/auth/teacher/link-student  { student_id }
+router.post('/teacher/link-student', verifyToken, requireRole('teacher'), async (req, res) => {
+  try {
+    const { student_id } = req.body || {};
+    if (!student_id) return res.status(400).json({ error: 'student_id wajib diisi' });
+    const s = await db.query(
+      'SELECT id, display_name, current_level, trial_level FROM students WHERE id = $1',
+      [student_id]
+    );
+    if (s.rowCount === 0) return res.status(404).json({ error: 'siswa tidak ditemukan' });
+    await db.query(
+      'INSERT INTO teacher_students (teacher_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [req.auth.sub, student_id]
+    );
+    res.json({ ok: true, student: s.rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
+// -- PARENT GATE ----------------------------------------------------------
+// GET /api/auth/parent-gate/challenge
 router.get('/parent-gate/challenge', (req, res) => {
-  const a = 2 + Math.floor(Math.random() * 8); // 2..9
-  const b = 2 + Math.floor(Math.random() * 8); // 2..9
+  const a = 2 + Math.floor(Math.random() * 8);
+  const b = 2 + Math.floor(Math.random() * 8);
   const challengeToken = jwt.sign({ ans: a * b, kind: 'gate_challenge' }, SECRET, { expiresIn: '2m' });
-  res.json({ challenge_token: challengeToken, question: `${a} Ã— ${b} = ?` });
+  res.json({ challenge_token: challengeToken, question: `${a} x ${b} = ?` });
 });
 
 // POST /api/auth/parent-gate/verify  { challenge_token, answer }
-// â†’ benar: { gate_token } (TTL 15 menit, dipakai utk akses area parent/guru)
 router.post('/parent-gate/verify', (req, res) => {
   const { challenge_token, answer } = req.body || {};
-  if (!challenge_token || answer === undefined) {
+  if (!challenge_token || answer === undefined)
     return res.status(400).json({ error: 'challenge_token + answer wajib' });
-  }
   try {
     const payload = jwt.verify(challenge_token, SECRET);
-    if (payload.kind !== 'gate_challenge') {
+    if (payload.kind !== 'gate_challenge')
       return res.status(401).json({ error: 'challenge tidak valid' });
-    }
-    if (Number(answer) !== Number(payload.ans)) {
-      return res.status(401).json({ error: 'jawaban salah â€” bukan orang tua/wali?' });
-    }
+    if (Number(answer) !== Number(payload.ans))
+      return res.status(401).json({ error: 'jawaban salah' });
     res.json({ gate_token: signToken({ kind: 'gate_pass' }, '15m') });
   } catch {
-    return res.status(401).json({ error: 'challenge kedaluwarsa â€” minta yang baru' });
+    return res.status(401).json({ error: 'challenge kedaluwarsa' });
   }
 });
 
-// GET /api/auth/me â€” echo payload token (uji middleware + dipakai app
-// untuk cek identitas setelah login: role, sub, verified)
+// GET /api/auth/me
 router.get('/me', verifyToken, (req, res) => {
   res.json({ auth: req.auth });
 });
 
-
-// -- STUDENT LOGIN --------------------------------------------------------
-// POST /api/auth/student/login  { student_id }
-// Siswa tidak punya password -- login dengan student_id yang disimpan di device.
-router.post('/student/login', async (req, res) => {
-  const { student_id } = req.body || {};
-  if (!student_id || typeof student_id !== 'string') {
-    return res.status(400).json({ error: 'student_id wajib diisi' });
-  }
-  try {
-    const r = await db.query(
-      'SELECT id, username, display_name AS name, grade_level AS kelas, current_level, trial_level, paid_basic_up_to_level, paid_premium_up_to_level FROM students WHERE id = ' + '',
-      [student_id]
-    );
-    if (r.rowCount === 0) return res.status(404).json({ error: 'siswa tidak ditemukan' });
-    const student = r.rows[0];
-    res.json({ student_id: student.id, student, token: signToken({ sub: student.id, role: 'student' }) });
-  } catch (err) {
-    console.error('student/login:', err.message);
-    res.status(500).json({ error: 'gagal login' });
-  }
-});
-// -- PARENT LINK CHILD ---------------------------------------------------
-// POST /api/auth/parent/link-child  { student_id }
-// Parent menghubungkan akun ke anak yang sudah terdaftar
-router.post('/parent/link-child', verifyToken, requireRole('parent'), async (req, res) => {
-  const { student_id } = req.body || {};
-  if (!student_id) return res.status(400).json({ error: 'student_id wajib diisi' });
-  try {
-    const s = await db.query('SELECT id, display_name, current_level, trial_level FROM students WHERE id = $1', [student_id]);
-    if (s.rowCount === 0) return res.status(404).json({ error: 'siswa tidak ditemukan' });
-    await db.query('INSERT INTO parent_children (parent_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [req.auth.sub, student_id]);
-    res.json({ ok: true, student: s.rows[0] });
-  } catch (err) {
-    console.error('parent/link-child:', err.message);
-    res.status(500).json({ error: 'gagal menghubungkan akun' });
-  }
-});
-
 module.exports = router;
-
-
-
-
-

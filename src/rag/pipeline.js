@@ -181,12 +181,17 @@ async function generateOutput(text, level, accessType, conceptId) {
 
   if (accessType === 'premium') {
     try {
-      const { audioBuffer, mimeType } = await geminiTTS.synthesize(normalizedText);
-      const wavBuffer = geminiTTS.pcmToWav(audioBuffer);
+      // Sprint G.2 — sample rate aktual dari response Gemini TTS (bukan hardcode),
+      // dipakai untuk WAV header & pcmToVisemes agar timeline viseme presisi.
+      const { audioBuffer, mimeType, sampleRate } = await geminiTTS.synthesize(normalizedText);
+      const wavBuffer = geminiTTS.pcmToWav(audioBuffer, sampleRate);
       const audioUrl = `data:audio/wav;base64,${wavBuffer.toString('base64')}`;
-      return { text: normalizedText, audioUrl, tier: 'premium' };
+      // Sprint G.2 — viseme dari energi RMS PCM (format identik Rhubarb
+      // { mouthCues: [{start,end,value}] }) → BotCharacter lip-sync sinkron.
+      const visemes = geminiTTS.pcmToVisemes(audioBuffer, sampleRate);
+      return { text: normalizedText, audioUrl, visemes, tier: 'premium' };
     } catch {
-      return { text: normalizedText, audioUrl: null, tier: 'premium', ttsError: true };
+      return { text: normalizedText, audioUrl: null, visemes: null, tier: 'premium', ttsError: true };
     }
   }
 
@@ -202,15 +207,42 @@ async function generateOutput(text, level, accessType, conceptId) {
       return {
         text: normalizedText,
         audioUrl: pregenerated.rows[0].audio_url,
+        visemes: null,
         tier: 'basic',
         upgradeMessage: null,
       };
     }
   }
 
+  // Sprint G.1 — fallback ke level_audio_segments: audio pre-generated per level
+  // (+ viseme Rhubarb) walau explanations.audio_url tidak terisi ETL.
+  // Segmen 'main' diprioritaskan; jika tidak ada, segmen pertama.
+  try {
+    const segments = await db.query(
+      `SELECT audio_url, viseme_json
+       FROM level_audio_segments
+       WHERE level_id = $1 AND audio_url IS NOT NULL
+       ORDER BY CASE WHEN segment = 'main' THEN 0 ELSE 1 END, id
+       LIMIT 1`,
+      [level]
+    );
+    if (segments.rows.length > 0 && segments.rows[0].audio_url) {
+      return {
+        text: normalizedText,
+        audioUrl: segments.rows[0].audio_url,
+        visemes: segments.rows[0].viseme_json || null,
+        tier: 'basic',
+        upgradeMessage: null,
+      };
+    }
+  } catch (segErr) {
+    console.warn('[RAG] level_audio_segments fallback failed:', segErr.message);
+  }
+
   return {
     text: normalizedText,
     audioUrl: null,
+    visemes: null,
     tier: 'basic',
     upgradeMessage: `Upgrade ke Premium Level ${level} supaya Kak Cadas bisa jawab langsung pertanyaan ini!`,
   };
@@ -290,9 +322,13 @@ async function askKak({ studentId, questionText, conceptId, level, accessType })
   return {
     answer: output.text,
     audioUrl: output.audioUrl,
+    visemes: output.visemes || null,
     source,
     tier: output.tier,
     upgradeMessage: output.upgradeMessage || null,
+    // Sprint G.2 — forward ttsError supaya client tahu TTS gagal (audio null)
+    // bukan karena premium off (tier tetap premium), tapi karena sintetizador.
+    ttsError: output.ttsError || null,
     cached: false,
   };
 }

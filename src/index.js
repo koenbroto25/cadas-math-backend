@@ -4,7 +4,6 @@ const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
 const db = require('./database/db');
-const { verifyToken } = require('./middleware/auth');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -19,17 +18,18 @@ app.use('/exercises', express.static(path.join(SPEED_MASTER, 'output', 'exercise
 app.use('/audio',     express.static(path.join(SPEED_MASTER, 'audio')));
 
 // Routes
-app.use('/api/auth',        require('./routes/auth'));
-app.use('/api/exercises',   require('./routes/exercises'));
-app.use('/api/progress',    require('./routes/progress'));
-app.use('/api/placement',   require('./routes/placement'));
-app.use('/api/upgrade-test',require('./routes/upgrade-test'));
-app.use('/api/rag',         require('./routes/rag'));
-app.use('/api/payment',     require('./routes/payment'));
-app.use('/api/admin',       require('./routes/admin'));    // Sprint D.4 - admin dashboard
-app.use('/api/referrer',    require('./routes/referrer')); // Sprint D.3+D.5 - referrer auth+dashboard
-app.use('/api/parent',    require('./routes/parent'));  // Sprint E
-app.use('/api/xendit',      require('./routes/xendit'));   // Sprint D.2 - xendit gateway
+app.use('/api/auth',         require('./routes/auth'));
+app.use('/api/exercises',    require('./routes/exercises'));
+app.use('/api/progress',     require('./routes/progress'));
+app.use('/api/placement',    require('./routes/placement'));
+app.use('/api/upgrade-test', require('./routes/upgrade-test'));
+app.use('/api/rag',          require('./routes/rag'));
+app.use('/api/payment',      require('./routes/payment'));
+app.use('/api/admin',        require('./routes/admin'));       // Sprint D.4 - admin dashboard
+app.use('/api/referrer',     require('./routes/referrer'));    // Sprint D.3+D.5 - referrer auth+dashboard
+app.use('/api/teacher',      require('./routes/teacher'));     // Sprint F
+app.use('/api/parent',       require('./routes/parent'));      // Sprint E
+app.use('/api/xendit',       require('./routes/xendit'));      // Sprint D.2 - xendit gateway
 
 // Sprint D.6 - /d/:token redirect (download link tracker)
 app.get('/d/:token', async (req, res) => {
@@ -101,4 +101,3 @@ app.listen(PORT, () => {
 });
 
 module.exports = app;
-
