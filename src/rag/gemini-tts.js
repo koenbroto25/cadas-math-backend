@@ -28,8 +28,8 @@ class GeminiTTSClient {
       if (goog && !keys.includes(goog.trim())) keys.push(goog.trim());
     }
     this.apiKeys = keys;
-    // Sprint G.2 — default model: Gemini 2.5 Flash Preview TTS (TTS native multimodal).
-    this.model = process.env.GEMINI_TTS_MODEL || 'gemini-2.5-flash-preview-tts';
+    // Sprint G.2 — default model: Gemini 3.1 Flash Preview TTS.
+    this.model = process.env.GEMINI_TTS_MODEL || 'gemini-3.1-flash-tts-preview';
     // Sprint G.2 — voice prebuilt Gemini TTS (bukan nama Cloud TTS). 'Kore' = firm.
     this.voiceName = process.env.GEMINI_TTS_VOICE || 'Kore';
     this._keyIndex = 0;

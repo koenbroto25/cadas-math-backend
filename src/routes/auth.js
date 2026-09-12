@@ -255,4 +255,35 @@ router.get('/me', verifyToken, (req, res) => {
   res.json({ auth: req.auth });
 });
 
+
+// GET /api/auth/teacher/by-code/:code  — public, murid cari guru by kode
+router.get('/teacher/by-code/:code', async (req, res) => {
+  try {
+    const r = await db.query(
+      'SELECT id, display_name, teacher_type, teacher_code FROM teachers WHERE teacher_code = $1',
+      [req.params.code.toUpperCase().trim()]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Kode guru tidak ditemukan' });
+    res.json({ teacher: r.rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/auth/student/link-teacher  { teacher_code }  — butuh JWT student
+router.post('/student/link-teacher', verifyToken, requireRole('student'), async (req, res) => {
+  try {
+    const { teacher_code } = req.body || {};
+    if (!teacher_code) return res.status(400).json({ error: 'teacher_code wajib diisi' });
+    const t = await db.query(
+      'SELECT id, display_name, teacher_type FROM teachers WHERE teacher_code = $1',
+      [teacher_code.toUpperCase().trim()]
+    );
+    if (t.rowCount === 0) return res.status(404).json({ error: 'Kode guru tidak ditemukan' });
+    const teacher = t.rows[0];
+    await db.query(
+      'INSERT INTO teacher_students (teacher_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [teacher.id, req.auth.sub]
+    );
+    res.json({ ok: true, teacher });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 module.exports = router;

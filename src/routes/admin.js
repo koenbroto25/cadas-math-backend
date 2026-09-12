@@ -73,10 +73,10 @@ router.get('/students/:id', async (req, res) => {
       'SELECT * FROM payment_records WHERE student_id = $1 ORDER BY created_at DESC',
       [req.params.id]);
     const invoices = await db.query(
-      'SELECT * FROM xendit_invoices WHERE student_id = $1 ORDER BY created_at DESC',
+      'SELECT * FROM midtrans_invoices WHERE student_id = $1 ORDER BY created_at DESC',
       [req.params.id]);
 
-    res.json({ student: s.rows[0], payment_records: payments.rows, xendit_invoices: invoices.rows });
+    res.json({ student: s.rows[0], payment_records: payments.rows, midtrans_invoices: invoices.rows });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -160,16 +160,16 @@ router.get('/payments', async (req, res) => {
       ORDER BY p.created_at DESC LIMIT $1 OFFSET $2
     `, [limit, offset]);
 
-    const xendit = await db.query(`
-      SELECT 'xendit' AS source, x.id, x.student_id, s.display_name,
+    const midtrans = await db.query(`
+      SELECT 'midtrans' AS source, x.id, x.student_id, s.display_name,
              x.product_type, x.level_from, x.level_to, x.amount_idr,
-             'xendit_invoice' AS payment_method, x.referrer_code,
+             'midtrans_core' AS payment_method, x.referrer_code,
              (x.status = 'paid') AS is_confirmed, x.paid_at, x.created_at
-      FROM xendit_invoices x JOIN students s ON s.id = x.student_id
+      FROM midtrans_invoices x JOIN students s ON s.id = x.student_id
       ORDER BY x.created_at DESC LIMIT $1 OFFSET $2
     `, [limit, offset]);
 
-    res.json({ manual: manual.rows, xendit: xendit.rows });
+    res.json({ manual: manual.rows, midtrans: midtrans.rows });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
