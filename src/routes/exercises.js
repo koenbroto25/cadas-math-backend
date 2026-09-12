@@ -1,4 +1,4 @@
-/**
+﻿/**
  * GET /api/exercises/:level   — daftar soal per level
  * GET /api/exercises/item/:id — satu soal by source_id (mis. L5_P4_001)
  */
@@ -46,4 +46,16 @@ router.get('/item/:id', async (req, res) => {
   }
 });
 
+
+// GET /api/exercises/level-info/:level_id
+router.get('/level-info/:level_id', async (req, res) => {
+  try {
+    const r = await db.query(
+      'SELECT id, name, description FROM levels WHERE id = $1',
+      [parseInt(req.params.level_id)]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'level tidak ditemukan' });
+    res.json(r.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 module.exports = router;
