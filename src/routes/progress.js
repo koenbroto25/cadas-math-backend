@@ -91,6 +91,16 @@ router.post('/session', async (req, res) => {
       }
     }
 
+    // Hitung total sesi di level ini untuk frontend bot audio selection
+    let sessionCount = 0;
+    if (student_id) {
+      const scTotal = await db.query(
+        'SELECT COUNT(*)::int AS cnt FROM student_sessions WHERE student_id = $1 AND level_id = $2',
+        [student_id, levelId]
+      );
+      sessionCount = scTotal.rows[0].cnt;
+    }
+
     res.status(201).json({
       session_id:      sessionId,
       created_at:      createdAt,
@@ -100,6 +110,7 @@ router.post('/session', async (req, res) => {
       accuracy:        Number(accuracy.toFixed(3)),
       level_up:        levelUp,
       new_level:       newLevel,
+      session_count:   sessionCount,
     });
   } catch (err) {
     console.error('POST /api/progress/session error:', err.message);
