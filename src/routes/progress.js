@@ -1,4 +1,4 @@
-/**
+﻿/**
  * POST /api/progress/session — simpan hasil sesi latihan
  * GET  /api/progress/:studentId — ringkasan progres siswa
  */
@@ -24,12 +24,13 @@ router.post('/session', async (req, res) => {
     return res.status(400).json({ error: 'student_id harus UUID valid' });
   }
 
-  const total = results.length;
+  const total   = results.length;
   const correct = results.filter((r) => r.correct).length;
-  const times = results.filter((r) => r.timeMs && r.timeMs > 0).map((r) => r.timeMs);
+  const times   = results.filter((r) => r.timeMs && r.timeMs > 0).map((r) => r.timeMs);
   const avgTime = times.length
     ? Math.round(times.reduce((a, b) => a + b, 0) / times.length)
     : null;
+  const accuracy = total > 0 ? correct / total : 0;
 
   try {
     const r = await db.query(
@@ -39,7 +40,7 @@ router.post('/session', async (req, res) => {
        RETURNING id, created_at`,
       [
         student_id || null,
-        device_id || null,
+        device_id  || null,
         levelId,
         total,
         correct,
@@ -47,12 +48,58 @@ router.post('/session', async (req, res) => {
         JSON.stringify(results),
       ]
     );
+
+    const sessionId = r.rows[0].id;
+    const createdAt = r.rows[0].created_at;
+
+    // ── Level-up check ────────────────────────────────────────────────────
+    // Syarat: student terdaftar + akurasi >= 80% + sudah >= 3 sesi di level ini
+    let levelUp  = false;
+    let newLevel = levelId;
+
+    if (student_id && accuracy >= 0.8 && levelId < 15) {
+      // Cek 3 sesi TERAKHIR di level ini ? semua harus >= 80% akurasi (konsekutif)
+      const sc = await db.query(
+        `SELECT COUNT(*)::int AS cnt,
+                MIN(correct_count::numeric / NULLIF(total_questions, 0)) AS min_acc
+         FROM (
+           SELECT correct_count, total_questions
+           FROM student_sessions
+           WHERE student_id = $1 AND level_id = $2
+           ORDER BY created_at DESC
+           LIMIT 3
+         ) last3`,
+        [student_id, levelId]
+      );
+      const { cnt, min_acc } = sc.rows[0];
+      if (cnt >= 3 && parseFloat(min_acc) >= 0.8) {
+        // Hanya naik kalau current_level siswa masih di level ini
+        const stu = await db.query(
+          'SELECT current_level FROM students WHERE id = $1',
+          [student_id]
+        );
+        const cur = stu.rows[0]?.current_level ?? levelId;
+        if (cur === levelId) {
+          newLevel = levelId + 1;
+          await db.query(
+            'UPDATE students SET current_level = $1 WHERE id = $2',
+            [newLevel, student_id]
+          );
+          levelUp = true;
+          console.log(`[level-up] student ${student_id}: level ${levelId} -> ${newLevel}`);
+        }
+      }
+    }
+
     res.status(201).json({
-      session_id: r.rows[0].id,
-      created_at: r.rows[0].created_at,
+      session_id:      sessionId,
+      created_at:      createdAt,
       total_questions: total,
-      correct_count: correct,
-      avg_time_ms: avgTime,
+      correct_count:   correct,
+      avg_time_ms:     avgTime,
+      accuracy:        Number(accuracy.toFixed(3)),
+      level_up:        levelUp,
+      new_level:       newLevel,
     });
   } catch (err) {
     console.error('POST /api/progress/session error:', err.message);
@@ -97,12 +144,12 @@ router.get('/:studentId', async (req, res) => {
 
     const a = agg.rows[0];
     res.json({
-      student: stu.rows[0],
-      total_sessions: a.sessions,
-      total_questions: a.questions,
-      total_correct: a.correct,
+      student:          stu.rows[0],
+      total_sessions:   a.sessions,
+      total_questions:  a.questions,
+      total_correct:    a.correct,
       overall_accuracy: a.questions > 0 ? Number((a.correct / a.questions).toFixed(3)) : 0,
-      per_level: perLevel.rows,
+      per_level:        perLevel.rows,
     });
   } catch (err) {
     console.error('GET /api/progress/:studentId error:', err.message);
