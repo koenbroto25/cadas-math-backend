@@ -1,4 +1,4 @@
-ï»¿/**
+/**
  * FASE 3.1 - Auth: register/login 3 role + Parent Gate.
  */
 const express = require('express');
@@ -13,26 +13,39 @@ const BCRYPT_ROUNDS = 10;
 const SECRET       = process.env.JWT_SECRET || 'cadas_app_secure_secret_key_2026';
 
 // -- STUDENT --------------------------------------------------------------
-// POST /api/auth/student/register  { name, kelas }
+// POST /api/auth/student/register  { name, kelas, referral_code? }
+// referral_code opsional — dikirim frontend jika siswa datang via link /d/:token
 router.post('/student/register', async (req, res) => {
-  const { name, kelas } = req.body || {};
+  const { name, kelas, referral_code } = req.body || {};
   if (!name || typeof name !== 'string' || name.trim().length < 2)
     return res.status(400).json({ error: 'name wajib diisi (min 2 karakter)' });
   const grade = parseInt(kelas, 10);
   if (!Number.isInteger(grade) || grade < 1 || grade > 9)
     return res.status(400).json({ error: 'kelas harus angka 1-9' });
   try {
+    // Resolve referral_code ? referrer id (jika ada dan aktif)
+    let referredBy = null;
+    if (referral_code && typeof referral_code === 'string') {
+      const ref = await db.query(
+        `SELECT id, type, is_active FROM referrers
+         WHERE referral_code = $1 AND status = 'approved' AND is_active = true`,
+        [referral_code.trim().toUpperCase()]
+      );
+      if (ref.rowCount > 0) referredBy = ref.rows[0].id;
+    }
+
     const username = `siswa_${crypto.randomBytes(4).toString('hex')}`;
     const r = await db.query(
-      `INSERT INTO students (username, display_name, grade_level, current_level, trial_level)
-       VALUES ($1, $2, $3, 1, 1)
+      `INSERT INTO students (username, display_name, grade_level, current_level, trial_level, referred_by)
+       VALUES ($1, $2, $3, 1, 1, $4)
        RETURNING id, username, display_name AS name, grade_level AS kelas, current_level`,
-      [username, name.trim(), grade]
+      [username, name.trim(), grade, referredBy]
     );
     const student = r.rows[0];
     res.status(201).json({
       student_id: student.id,
       student,
+      referral_attached: referredBy !== null,
       token: signToken({ sub: student.id, role: 'student' }),
     });
   } catch (err) {
@@ -256,7 +269,7 @@ router.get('/me', verifyToken, (req, res) => {
 });
 
 
-// GET /api/auth/teacher/by-code/:code  â€” public, murid cari guru by kode
+// GET /api/auth/teacher/by-code/:code  — public, murid cari guru by kode
 router.get('/teacher/by-code/:code', async (req, res) => {
   try {
     const r = await db.query(
@@ -268,7 +281,7 @@ router.get('/teacher/by-code/:code', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST /api/auth/student/link-teacher  { teacher_code }  â€” butuh JWT student
+// POST /api/auth/student/link-teacher  { teacher_code }  — butuh JWT student
 router.post('/student/link-teacher', verifyToken, requireRole('student'), async (req, res) => {
   try {
     const { teacher_code } = req.body || {};

@@ -165,4 +165,73 @@ router.put('/password', verifyReferrerToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+
+// GET /api/referrer/students?page=1&limit=20
+// Marketing & sekolah lihat murid yang masuk via referral mereka
+router.get('/students', verifyReferrerToken, async (req, res) => {
+  try {
+    const page   = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit  = Math.min(50, parseInt(req.query.limit) || 20);
+    const offset = (page - 1) * limit;
+
+    // Ambil referral_code milik referrer ini
+    const ref = await db.query(
+      'SELECT referral_code, type FROM referrers WHERE id = $1', [req.auth.sub]);
+    if (ref.rowCount === 0) return res.status(404).json({ error: 'referrer tidak ditemukan' });
+    const { referral_code, type } = ref.rows[0];
+
+    const rows = await db.query(`
+      SELECT s.id, s.display_name, s.username, s.current_level,
+             s.paid_basic_up_to_level, s.paid_premium_up_to_level,
+             s.created_at AS joined_at,
+             COALESCE(SUM(e.commission_idr), 0) AS total_commission_idr
+      FROM students s
+      LEFT JOIN referrer_earnings e ON e.student_id = s.id AND e.referrer_id = $1
+      WHERE s.referred_by = $2
+      GROUP BY s.id
+      ORDER BY s.created_at DESC
+      LIMIT $3 OFFSET $4
+    `, [req.auth.sub, req.auth.sub, limit, offset]);
+
+    const total = await db.query(
+      'SELECT COUNT(*) FROM students WHERE referred_by = $1', [req.auth.sub]);
+
+    res.json({
+      page, limit,
+      total: parseInt(total.rows[0].count),
+      referral_code,
+      type,
+      students: rows.rows
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/referrer/linked-schools
+// Khusus marketing: lihat sekolah yang dilinkkan ke akun marketing ini
+router.get('/linked-schools', verifyReferrerToken, async (req, res) => {
+  try {
+    const ref = await db.query(
+      'SELECT type FROM referrers WHERE id = $1', [req.auth.sub]);
+    if (ref.rowCount === 0) return res.status(404).json({ error: 'referrer tidak ditemukan' });
+    if (ref.rows[0].type !== 'marketing') {
+      return res.status(403).json({ error: 'endpoint ini hanya untuk tipe marketing' });
+    }
+
+    const rows = await db.query(`
+      SELECT sml.id AS link_id, sml.is_active, sml.created_at AS linked_at,
+             r.id AS school_id, r.full_name AS school_name,
+             r.referral_code AS school_code,
+             r.commission_rate AS school_rate,
+             r.total_conversions AS school_total_students,
+             r.total_earnings_idr AS school_total_earned_idr
+      FROM school_marketing_links sml
+      JOIN referrers r ON r.id = sml.school_id
+      WHERE sml.marketing_id = $1
+      ORDER BY sml.created_at DESC
+    `, [req.auth.sub]);
+
+    res.json({ linked_schools: rows.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 module.exports = router;

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * RAG API Endpoints — FASE 8
  *
  * POST /api/rag/ask              — Main AskKak pipeline
@@ -12,7 +12,7 @@
 
 const express = require('express');
 const router = express.Router();
-const db = require('../database/db'); // shared pool â€” fix duplikasi koneksi (Sprint B)
+const db = require('../database/db'); // shared pool — fix duplikasi koneksi (Sprint B)
 const { askKak, normalizeOutput } = require('../rag/pipeline');
 const { selectExplanationVariant, recordVariantShown, recordVariantHelpful } = require('../rag/selection-rule');
 const { getLevelAccess } = require('../middleware/level-access');

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Placement Test API Endpoints
  *
  * POST /api/placement/start     - Start placement test (get probe set)

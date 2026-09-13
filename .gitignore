@@ -1,3 +1,18 @@
 node_modules/
 .env
 *.log
+
+# Documents — semua markdown di-ignore (backup: r2-backup-*.zip di root workspace)
+*.md
+!LICENSE
+
+# Backup arsip workspace
+r2-backup-*.zip
+_backup_stage/
+_zip_check/
+
+# Skrip utility sementara
+scripts/backup-r2-assets.js
+scripts/complete-visemes.js
+clean-mojibake.js
+check-jsx.js

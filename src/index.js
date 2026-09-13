@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
@@ -31,42 +31,36 @@ app.use('/api/teacher',      require('./routes/teacher'));     // Sprint F
 app.use('/api/parent',       require('./routes/parent'));      // Sprint E
 app.use('/api/midtrans',    require('./routes/midtrans'));   // Sprint D.2 - midtrans gateway
 
-// Sprint D.6 - /d/:token redirect (download link tracker)
+// Sprint D.6 - /d/:token redirect (download link tracker + referral attach)
+// Alur: sekolah/marketing share link /d/:token ke WA grup
+// Siswa klik -> tracking click -> redirect ke PWA dengan ?ref=REFERRAL_CODE
+// Frontend PWA simpan ?ref ke localStorage -> kirim saat register
 app.get('/d/:token', async (req, res) => {
   const { token } = req.params;
   if (!/^[A-Za-z0-9_-]+$/.test(token)) return res.status(400).send('Token tidak valid');
-
-  const STORE_URL = process.env.APP_STORE_URL || 'https://play.google.com/store/apps/details?id=com.cadasapp';
-
+  let referralCode = null;
   try {
     const r = await db.query(
-      'SELECT id FROM referrers WHERE referral_token = $1', [token]);
-
-    const referrerId = r.rowCount > 0 ? r.rows[0].id : null;
-
-    // Log klik
-    const ipRaw = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '';
-    const ip    = ipRaw.split(',')[0].trim();
-    // Hash IP sederhana (privacy)
+      "SELECT id, referral_code, is_active FROM referrers WHERE referral_token = $1 AND status = 'approved'",
+      [token]);
+    const referrer   = r.rowCount > 0 ? r.rows[0] : null;
+    const referrerId = referrer ? referrer.id : null;
+    referralCode     = referrer ? referrer.referral_code : null;
     const crypto = require('crypto');
-    const ipHash = crypto.createHash('sha256').update(ip).digest('hex').slice(0, 16);
-
-    await db.query(`
-      INSERT INTO download_clicks (referral_token, referrer_id, ip_hash, user_agent)
-      VALUES ($1, $2, $3, $4)
-    `, [token, referrerId, ipHash, req.headers['user-agent'] || '']);
-
-    if (referrerId) {
-      await db.query(
-        'UPDATE referrers SET total_clicks = total_clicks + 1 WHERE id = $1',
-        [referrerId]);
+    const ipRaw  = (req.headers['x-forwarded-for'] || '').split(',')[0] || req.ip || '';
+    const ipHash = crypto.createHash('sha256').update(ipRaw).digest('hex');
+    await db.query(
+      'INSERT INTO download_clicks (referral_token, referrer_id, ip_hash, user_agent) VALUES ($1, $2, $3, $4)',
+      [token, referrerId, ipHash, req.headers['user-agent'] || '']);
+    if (referrerId && referrer.is_active) {
+      await db.query('UPDATE referrers SET total_clicks = total_clicks + 1 WHERE id = $1', [referrerId]);
     }
   } catch (err) {
     console.error('Download click tracking error:', err.message);
-    // Tetap redirect meski tracking gagal
   }
-
-  res.redirect(302, STORE_URL);
+  const pwaUrl = process.env.PWA_URL || 'https://cadasmatematika.id';
+  const dest   = referralCode ? (pwaUrl + '?ref=' + encodeURIComponent(referralCode)) : pwaUrl;
+  res.redirect(302, dest);
 });
 
 // TTS per-soal cache + Viseme + Bot Audio — Sprint H.4
@@ -102,6 +96,15 @@ app.get('/api/bot-audio/:file', (req, res) => {
   res.status(404).json({ error: 'bot audio tidak tersedia' });
 });
 
+// Sprint H.7 — Bot viseme endpoint (R2 redirect ke /bot/speech/visemes/)
+app.get('/api/bot-viseme/:file', (req, res) => {
+  if (!/^[A-Za-z0-9_\-]+$/.test(req.params.file)) {
+    return res.status(400).json({ error: 'file tidak valid' });
+  }
+  if (R2_URL) return res.redirect(302, R2_URL + '/bot/speech/visemes/' + req.params.file + '.json');
+  res.status(404).json({ error: 'bot viseme tidak tersedia' });
+});
+
 // Health check
 app.get('/api/health', async (req, res) => {
   try {
@@ -123,3 +126,4 @@ app.listen(PORT, () => {
 });
 
 module.exports = app;
+

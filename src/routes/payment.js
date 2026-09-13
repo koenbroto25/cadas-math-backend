@@ -1,4 +1,4 @@
-﻿/**
+/**
  * routes/payment.js - FASE 6
  * POST /api/payment/upgrade-tier
  * POST /api/admin/billing/activate

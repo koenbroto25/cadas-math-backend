@@ -35,17 +35,83 @@ const PRICING = {
   upgrade_diff: 25000,
 };
 
-async function calcCommission(referrerCode, amountIdr) {
-  if (!referrerCode) return { referrerId: null, commission: 0 };
-  const r = await db.query(
-    "SELECT id, commission_rate FROM referrers WHERE referral_code = $1 AND status = 'approved'",
+// Sprint I — getSettings + calcSplitFee + saveEarnings (identik admin.js)
+async function getSettings() {
+  const rows = await db.query('SELECT key, value FROM referral_settings');
+  return Object.fromEntries(rows.rows.map(r => [r.key, r.value]));
+}
+
+const { v4: uuidv4 } = require('uuid');
+
+async function calcSplitFee(referrerCode, amountIdr, settings) {
+  if (!referrerCode) return [];
+  const ref = await db.query(
+    "SELECT id, type, commission_rate, is_active FROM referrers WHERE referral_code = $1 AND status = 'approved'",
     [referrerCode]
   );
-  if (r.rowCount === 0) return { referrerId: null, commission: 0 };
-  return {
-    referrerId: r.rows[0].id,
-    commission: Math.round(amountIdr * parseFloat(r.rows[0].commission_rate) / 100),
-  };
+  if (ref.rowCount === 0 || !ref.rows[0].is_active) return [];
+  const referrer    = ref.rows[0];
+  const splitActive = settings.split_fee_enabled === 'true';
+  const results     = [];
+  const splitGroupId = uuidv4();
+
+  if (referrer.type === 'school') {
+    if (settings.school_enabled !== 'true') return [];
+    const rate   = parseFloat(referrer.commission_rate) || parseFloat(settings.school_rate) || 30;
+    const amount = Math.round(amountIdr * rate / 100);
+    results.push({ referrerId: referrer.id, type: 'school', rate, amount, splitGroupId });
+    if (splitActive && settings.marketing_enabled === 'true') {
+      const link = await db.query(
+        `SELECT sml.marketing_id, r.commission_rate, r.is_active
+           FROM school_marketing_links sml
+           JOIN referrers r ON r.id = sml.marketing_id
+          WHERE sml.school_id = $1 AND sml.is_active = true AND r.is_active = true
+          LIMIT 1`,
+        [referrer.id]
+      );
+      if (link.rowCount > 0) {
+        const mRate   = parseFloat(link.rows[0].commission_rate) || parseFloat(settings.marketing_rate) || 10;
+        const mAmount = Math.round(amountIdr * mRate / 100);
+        results.push({ referrerId: link.rows[0].marketing_id, type: 'marketing', rate: mRate, amount: mAmount, splitGroupId });
+      }
+    }
+  } else if (referrer.type === 'marketing') {
+    if (settings.marketing_enabled !== 'true') return [];
+    const rate   = parseFloat(referrer.commission_rate) || parseFloat(settings.marketing_rate) || 10;
+    const amount = Math.round(amountIdr * rate / 100);
+    results.push({ referrerId: referrer.id, type: 'marketing', rate, amount, splitGroupId });
+  } else if (referrer.type === 'parent') {
+    if (settings.parent_enabled !== 'true') return [];
+    const rate   = parseFloat(referrer.commission_rate) || parseFloat(settings.parent_rate) || 5;
+    const amount = Math.round(amountIdr * rate / 100);
+    results.push({ referrerId: referrer.id, type: 'parent', rate, amount, splitGroupId });
+  } else if (referrer.type === 'student') {
+    if (settings.student_enabled !== 'true') return [];
+    const rate   = parseFloat(referrer.commission_rate) || parseFloat(settings.student_rate) || 5;
+    const amount = Math.round(amountIdr * rate / 100);
+    results.push({ referrerId: referrer.id, type: 'student', rate, amount, splitGroupId });
+  }
+  return results;
+}
+
+async function saveEarnings(earnings, paymentRecordId, midtransInvoiceId, studentId, amountIdr) {
+  for (const e of earnings) {
+    await db.query(
+      `INSERT INTO referrer_earnings
+         (referrer_id, payment_record_id, midtrans_invoice_id, student_id,
+          amount_idr, commission_rate, commission_idr, split_group_id, referrer_type)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [e.referrerId, paymentRecordId, midtransInvoiceId, studentId,
+       amountIdr, e.rate, e.amount, e.splitGroupId, e.type]
+    );
+    await db.query(
+      `UPDATE referrers SET
+         total_conversions  = total_conversions + 1,
+         total_earnings_idr = total_earnings_idr + $1
+       WHERE id = $2`,
+      [e.amount, e.referrerId]
+    );
+  }
 }
 
 function verifySignature(orderId, statusCode, grossAmount) {
@@ -181,8 +247,12 @@ router.post('/webhook', async (req, res) => {
        WHERE id=$3`,
       [transaction_id || null, payment_type || null, invoice.id]);
 
+    // Catat komisi referrer — split fee sekolah+marketing (Sprint I)
+    const settings        = await getSettings();
+    const earnings        = await calcSplitFee(invoice.referrer_code, invoice.amount_idr, settings);
+    const totalCommission = earnings.reduce((s, e) => s + e.amount, 0);
+
     // Simpan payment_record
-    const { referrerId, commission } = await calcCommission(invoice.referrer_code, invoice.amount_idr);
     const pr = await db.query(`
       INSERT INTO payment_records
         (student_id, product_type, level_from, level_to, amount_idr,
@@ -190,24 +260,10 @@ router.post('/webhook', async (req, res) => {
       VALUES ($1,$2,$3,$4,$5,'midtrans_core',$6,$7,true,NOW())
       RETURNING id
     `, [invoice.student_id, invoice.product_type, invoice.level_from,
-        invoice.level_to, invoice.amount_idr, invoice.referrer_code, commission]);
+        invoice.level_to, invoice.amount_idr, invoice.referrer_code, totalCommission]);
 
-    // Catat komisi referrer
-    if (referrerId && commission > 0) {
-      await db.query(`
-        INSERT INTO referrer_earnings
-          (referrer_id, payment_record_id, midtrans_invoice_id, student_id,
-           amount_idr, commission_rate, commission_idr)
-        VALUES ($1,$2,$3,$4,$5,(SELECT commission_rate FROM referrers WHERE id=$1),$6)
-      `, [referrerId, pr.rows[0].id, invoice.id, invoice.student_id,
-          invoice.amount_idr, commission]);
-      await db.query(`
-        UPDATE referrers SET
-          total_conversions  = total_conversions + 1,
-          total_earnings_idr = total_earnings_idr + $1
-        WHERE id = $2
-      `, [commission, referrerId]);
-    }
+    await saveEarnings(earnings, pr.rows[0].id, invoice.id, invoice.student_id, invoice.amount_idr);
+    console.log('Midtrans webhook: earnings split ->', earnings.map(e => e.type + ' ' + e.amount + ' IDR').join(', ') || 'none');
 
     console.log(`Midtrans webhook: ${order_id} PAID -> siswa ${invoice.student_id} diaktifkan`);
     res.json({ ok: true, activated: true, student_id: invoice.student_id });
@@ -218,7 +274,7 @@ router.post('/webhook', async (req, res) => {
   }
 });
 
-// GET /api/midtrans/status/:order_id ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â cek dari DB
+// GET /api/midtrans/status/:order_id ÃƒÆ’Ã†’Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†’Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†’Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â cek dari DB
 router.get('/status/:order_id', verifyToken, async (req, res) => {
   try {
     const inv = await db.query(`
@@ -231,7 +287,7 @@ router.get('/status/:order_id', verifyToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/midtrans/check-live/:order_id ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â cek langsung ke Midtrans (polling fallback)
+// GET /api/midtrans/check-live/:order_id ÃƒÆ’Ã†’Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†’Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†’Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â cek langsung ke Midtrans (polling fallback)
 router.get('/check-live/:order_id', verifyToken, async (req, res) => {
   if (!MT_SERVER_KEY) return res.status(503).json({ error: 'Midtrans belum dikonfigurasi' });
   try {
