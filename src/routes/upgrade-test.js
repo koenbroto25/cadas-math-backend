@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Upgrade Test API Endpoints
  */
 
@@ -99,13 +99,26 @@ router.post('/:test_id/submit', async (req, res) => {
     const passed = accuracy >= threshold && withinTime;
 
     if (passed) {
+      // Naik current_level + set trial_level ke level berikutnya
+      // supaya siswa dapat preview 5 soal level baru sebelum bayar
       await db.query(
-        'UPDATE students SET current_level = GREATEST(current_level, $1) WHERE id = $2',
+        `UPDATE students
+         SET current_level = GREATEST(current_level, $1),
+             trial_level   = GREATEST(COALESCE(trial_level, 0), $1)
+         WHERE id = $2`,
         [test.level_to, studentId]
       );
+      console.log(`[upgrade-test] student ${studentId} lulus level ${test.level} → ${test.level_to}, trial_level diupdate`);
     }
 
-    res.json({ passed, accuracy, correctCount: correct, totalProblems: evaluated.length, withinTime });
+    res.json({
+      passed,
+      accuracy,
+      correctCount:  correct,
+      totalProblems: evaluated.length,
+      withinTime,
+      ...(passed && { new_level: test.level_to }),
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
