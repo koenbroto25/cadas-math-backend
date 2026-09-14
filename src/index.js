@@ -31,6 +31,21 @@ app.use('/api/teacher',      require('./routes/teacher'));     // Sprint F
 app.use('/api/parent',       require('./routes/parent'));      // Sprint E
 app.use('/api/midtrans',    require('./routes/midtrans'));   // Sprint D.2 - midtrans gateway
 
+// Sprint F.5 - /api/config: konfigurasi dinamis untuk mobile (public, tanpa auth)
+// Aplikasi fetch endpoint ini saat startup, simpan ke store/AsyncStorage.
+// Update nilai di sini (atau .env backend) → restart backend → app ikut berubah TANPA rebuild APK.
+app.get('/api/config', (req, res) => {
+  res.json({
+    apiVersion:  '1.0.0',
+    apiBase:     process.env.APP_BASE_URL || 'https://cadas.app',
+    pwaUrl:      process.env.PWA_URL      || 'https://cadasmatematika.id',
+    r2PublicUrl: process.env.R2_PUBLIC_URL || null,
+    adminWhatsapp: process.env.ADMIN_WHATSAPP || null,
+    // Flag kontrol fitur — tambahkan sesuai kebutuhan:
+    // maintenanceMode, minSupportedVersion, ttsEnabled, dsb.
+  });
+});
+
 // Sprint D.6 - /d/:token redirect (download link tracker + referral attach)
 // Alur: sekolah/marketing share link /d/:token ke WA grup
 // Siswa klik -> tracking click -> redirect ke PWA dengan ?ref=REFERRAL_CODE

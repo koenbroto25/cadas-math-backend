@@ -1,5 +1,6 @@
 node_modules/
 .env
+.env.railway
 *.log
 
 # Documents — semua markdown di-ignore (backup: r2-backup-*.zip di root workspace)

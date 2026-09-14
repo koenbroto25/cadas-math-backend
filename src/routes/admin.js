@@ -21,9 +21,40 @@
 const express = require('express');
 const router  = express.Router();
 const db      = require('../database/db');
+const SECRET_KEY = process.env.JWT_SECRET || 'cadas_app_secure_secret_key_2026';
+
+
+// Middleware: izinkan admin (x-admin-secret) ATAU referrer marketing (Bearer token)
+function allowAdminOrMarketing(req, res, next) {
+  // Admin via header secret
+  if (req.headers['x-admin-secret'] === process.env.ADMIN_SECRET) {
+    req.demoCallerKind = 'admin';
+    return next();
+  }
+  // Referrer marketing via JWT Bearer
+  const header = req.headers.authorization || '';
+  const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (token) {
+    try {
+      const payload = jwt.verify(token, SECRET_KEY);
+      if (payload.role === 'referrer') {
+        // Cek type marketing dari DB dilakukan di handler (agar tidak async di middleware)
+        req.auth = payload;
+        req.demoCallerKind = 'referrer';
+        return next();
+      }
+    } catch (_) { /* invalid token */ }
+  }
+  return res.status(401).json({ error: 'Akses ditolak: butuh admin secret atau token marketing' });
+}
+
 const bcrypt  = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
+const jwt     = require('jsonwebtoken');
 
+const SECRET = process.env.JWT_SECRET || 'cadas_app_secure_secret_key_2026';
+
+// Middleware admin (x-admin-secret header)
 function requireAdmin(req, res, next) {
   if (req.headers['x-admin-secret'] !== process.env.ADMIN_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -493,6 +524,252 @@ router.get('/billing/status/:student_id', async (req, res) => {
       'SELECT * FROM payment_records WHERE student_id = $1 ORDER BY created_at DESC',
       [req.params.student_id]);
     res.json({ student: s.rows[0], payment_history: p.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// TAMBAHAN ENDPOINTS — admin_rag_miss (Sprint K, 13 Sep 2026)
+// Tambahkan blok ini di admin.js SEBELUM baris `module.exports = router;`
+// ═══════════════════════════════════════════════════════════════════
+
+// ── RAG MISS — List ────────────────────────────────────────────────────────────
+// GET /api/admin/rag-miss
+// Query params:
+//   ?resolved=false   (default) | true | all
+//   ?level=8          filter by level
+//   ?page=1&limit=50
+router.get('/rag-miss', async (req, res) => {
+  try {
+    const page     = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit    = Math.min(100, parseInt(req.query.limit) || 50);
+    const offset   = (page - 1) * limit;
+    const resolved = req.query.resolved;   // 'true' | 'false' | 'all' | undefined
+    const level    = req.query.level ? parseInt(req.query.level) : null;
+
+    const conditions = [];
+    const params     = [];
+
+    if (resolved !== 'all') {
+      const resolvedBool = resolved === 'true';
+      params.push(resolvedBool);
+      conditions.push(`m.resolved = $${params.length}`);
+    }
+    if (level) {
+      params.push(level);
+      conditions.push(`m.level_id = $${params.length}`);
+    }
+
+    const where = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+
+    // Total count
+    const countRes = await db.query(
+      `SELECT COUNT(*) FROM admin_rag_miss m ${where}`, params
+    );
+    const total = parseInt(countRes.rows[0].count);
+
+    // Rows
+    params.push(limit, offset);
+    const rows = await db.query(
+      `SELECT
+         m.id,
+         m.level_id,
+         m.question_text,
+         m.top_sim_score,
+         m.top_chunk_text,
+         m.llm_answered,
+         m.llm_model,
+         m.resolved,
+         m.resolved_at,
+         m.resolved_note,
+         m.created_at,
+         s.display_name AS student_name,
+         s.username     AS student_username
+       FROM admin_rag_miss m
+       LEFT JOIN students s ON s.id = m.student_id
+       ${where}
+       ORDER BY m.created_at DESC
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
+    );
+
+    // Summary per level (untuk dashboard chart)
+    const summary = await db.query(
+      `SELECT level_id,
+              COUNT(*) AS total,
+              SUM(CASE WHEN resolved = false THEN 1 ELSE 0 END) AS unresolved,
+              SUM(CASE WHEN llm_answered = true THEN 1 ELSE 0 END) AS llm_answered
+       FROM admin_rag_miss
+       GROUP BY level_id
+       ORDER BY level_id`
+    );
+
+    res.json({
+      page, limit, total,
+      items:   rows.rows,
+      summary: summary.rows,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── RAG MISS — Mark resolved ───────────────────────────────────────────────────
+// PUT /api/admin/rag-miss/:id/resolve
+// Body: { resolved_note: "Materi sudah ditambah di level 8" }
+router.put('/rag-miss/:id/resolve', async (req, res) => {
+  const { resolved_note } = req.body || {};
+  try {
+    const r = await db.query(
+      `UPDATE admin_rag_miss
+       SET resolved = true, resolved_at = NOW(), resolved_note = $1
+       WHERE id = $2 AND resolved = false
+       RETURNING *`,
+      [resolved_note || null, req.params.id]
+    );
+    if (r.rowCount === 0) {
+      return res.status(404).json({ error: 'item tidak ditemukan atau sudah resolved' });
+    }
+    res.json({ ok: true, item: r.rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── RAG MISS — Bulk resolve by level ──────────────────────────────────────────
+// PUT /api/admin/rag-miss/resolve-level
+// Body: { level_id: 8, resolved_note: "Materi level 8 sudah diupdate" }
+router.put('/rag-miss/resolve-level', async (req, res) => {
+  const { level_id, resolved_note } = req.body || {};
+  if (!level_id) return res.status(400).json({ error: 'level_id wajib' });
+  try {
+    const r = await db.query(
+      `UPDATE admin_rag_miss
+       SET resolved = true, resolved_at = NOW(), resolved_note = $1
+       WHERE level_id = $2 AND resolved = false
+       RETURNING id`,
+      [resolved_note || null, level_id]
+    );
+    res.json({ ok: true, resolved_count: r.rowCount });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── RAG MISS — Delete (hapus false positive / noise) ─────────────────────────
+// DELETE /api/admin/rag-miss/:id
+router.delete('/rag-miss/:id', async (req, res) => {
+  try {
+    const r = await db.query(
+      'DELETE FROM admin_rag_miss WHERE id = $1 RETURNING id', [req.params.id]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'item tidak ditemukan' });
+    res.json({ ok: true, deleted_id: r.rows[0].id });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── RAG MISS — Stats ringkasan untuk dashboard ────────────────────────────────
+// GET /api/admin/rag-miss/stats
+router.get('/rag-miss/stats', async (req, res) => {
+  try {
+    const overall = await db.query(
+      `SELECT
+         COUNT(*) AS total,
+         SUM(CASE WHEN resolved = false THEN 1 ELSE 0 END) AS unresolved,
+         SUM(CASE WHEN resolved = true  THEN 1 ELSE 0 END) AS resolved,
+         SUM(CASE WHEN llm_answered = true THEN 1 ELSE 0 END) AS llm_answered,
+         SUM(CASE WHEN llm_answered = false AND resolved = false THEN 1 ELSE 0 END) AS unanswered,
+         ROUND(AVG(top_sim_score)::numeric, 4) AS avg_sim_score
+       FROM admin_rag_miss`
+    );
+
+    // Top 10 pertanyaan yang paling sering muncul (potensi materi baru)
+    const topQuestions = await db.query(
+      `SELECT question_text, level_id, COUNT(*) AS frequency,
+              MAX(top_sim_score) AS best_sim,
+              BOOL_OR(llm_answered) AS ever_llm_answered
+       FROM admin_rag_miss
+       WHERE resolved = false
+       GROUP BY question_text, level_id
+       ORDER BY frequency DESC
+       LIMIT 10`
+    );
+
+    // Tren 7 hari terakhir
+    const trend = await db.query(
+      `SELECT DATE(created_at) AS date, COUNT(*) AS miss_count
+       FROM admin_rag_miss
+       WHERE created_at >= NOW() - INTERVAL '7 days'
+       GROUP BY DATE(created_at)
+       ORDER BY date ASC`
+    );
+
+    res.json({
+      overall:      overall.rows[0],
+      top_questions: topQuestions.rows,
+      trend_7d:     trend.rows,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// TAMBAHKAN BLOK INI di admin.js, tepat sebelum baris: module.exports = router;
+// ── DEMO PASSCODES ────────────────────────────────────────────────────────
+// GET  /api/admin/demo-passcodes          — list semua passcode
+// POST /api/admin/demo-passcodes          — buat passcode baru
+// DELETE /api/admin/demo-passcodes/:id   — revoke passcode
+
+function randomCode() {
+  return String(Math.floor(1000 + Math.random() * 9000)); // 4 digit, tidak mulai 0
+}
+
+router.get('/demo-passcodes', allowAdminOrMarketing, async (req, res) => {
+  try {
+    const rows = await db.query(
+      `SELECT id, code, label, expires_at, redeemed_at, is_active, created_at
+       FROM demo_passcodes ORDER BY created_at DESC`
+    );
+    res.json({ passcodes: rows.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.post('/demo-passcodes', allowAdminOrMarketing, async (req, res) => {
+  // Body opsional: { label: "Demo SMP Banjarbaru", hours: 4 }
+  const { label, hours } = req.body || {};
+  // Jika caller adalah referrer, pastikan type = marketing
+  if (req.demoCallerKind === 'referrer') {
+    try {
+      const ref = await db.query("SELECT type FROM referrers WHERE id = $1", [req.auth.sub]);
+      if (ref.rowCount === 0 || ref.rows[0].type !== 'marketing') {
+        return res.status(403).json({ error: 'Hanya referrer tipe marketing yang bisa buat passcode' });
+      }
+    } catch (e) { return res.status(500).json({ error: e.message }); }
+  }
+  const ttlHours = Math.min(72, Math.max(1, parseInt(hours) || 2));
+  try {
+    let code, inserted = false;
+    // Coba sampai dapat kode unik (max 10x)
+    for (let i = 0; i < 10; i++) {
+      code = randomCode();
+      try {
+        const r = await db.query(
+          `INSERT INTO demo_passcodes (code, label, expires_at)
+           VALUES ($1, $2, NOW() + INTERVAL '1 hour' * $3)
+           RETURNING id, code, label, expires_at, created_at`,
+          [code, label || null, ttlHours]
+        );
+        res.status(201).json({ ok: true, passcode: r.rows[0] });
+        inserted = true;
+        break;
+      } catch (e) {
+        if (e.code !== '23505') throw e; // bukan duplicate, lempar
+        // duplicate code → coba lagi
+      }
+    }
+    if (!inserted) res.status(500).json({ error: 'Gagal generate kode unik' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.delete('/demo-passcodes/:id', allowAdminOrMarketing, async (req, res) => {
+  try {
+    const r = await db.query(
+      `UPDATE demo_passcodes SET is_active = false WHERE id = $1 RETURNING id`,
+      [req.params.id]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'passcode tidak ditemukan' });
+    res.json({ ok: true, revoked_id: r.rows[0].id });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 

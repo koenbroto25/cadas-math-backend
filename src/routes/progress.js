@@ -85,19 +85,22 @@ router.post('/session', async (req, res) => {
         [student_id, levelId]
       );
       if (sc.rows[0].cnt >= 3) {
-        const stu = await db.query(
-          'SELECT current_level FROM students WHERE id=$1',
-          [student_id]
+        // Atomic conditional update — hindari race condition check-then-act.
+        // WHERE current_level = levelId memastikan hanya satu request yang bisa
+        // berhasil meng-update kalau dua request datang bersamaan untuk siswa
+        // yang sama; request lain akan mendapat rowCount 0 dan tidak menaikkan
+        // level lagi (level tidak naik dobel).
+        const upd = await db.query(
+          `UPDATE students
+             SET current_level = $1,
+                 trial_level   = GREATEST(trial_level, $1)
+           WHERE id = $2 AND current_level = $3
+           RETURNING current_level`,
+          [levelId + 1, student_id, levelId]
         );
-        const cur = stu.rows[0]?.current_level ?? levelId;
-        if (cur === levelId) {
-          newLevel = levelId + 1;
-          // Naik level + buka trial untuk level berikutnya
-          await db.query(
-            'UPDATE students SET current_level=$1, trial_level=GREATEST(trial_level, $1) WHERE id=$2',
-            [newLevel, student_id]
-          );
-          levelUp = true;
+        if (upd.rowCount > 0) {
+          newLevel = upd.rows[0].current_level;
+          levelUp  = true;
           console.log(`[level-up] student ${student_id}: ${levelId} -> ${newLevel}`);
         }
       }

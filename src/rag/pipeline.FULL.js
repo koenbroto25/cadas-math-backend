@@ -1,21 +1,35 @@
 /**
- * RAG Pipeline — VERSI TRIAL TANPA OLLAMA (backup asli: pipeline.FULL.js)
+ * RAG Pipeline — 3-layer hybrid (Sprint K, revisi 13 Sep 2026)
  *
- * Arsitektur trial — Layer 1 semantic search + embedding BGE-M3/Ollama DIHAPUS:
- *   Cache   : exact-match student_questions
- *   Layer 2 : LLM primary — openai/gpt-4o-mini via OpenRouter (93 key rotasi)
- *   Layer 3 : LLM fallback — gemini-3.1-flash-lite via Google AI (200 key rotasi)
- *   Post-LLM: math-validator (mathjs) + normalizer + output by access level
+ * Layer 1 : Semantic Search  — BGE-M3 via Ollama lokal (1024-dim, cosine)
+ *             Corpus: ~14.926 chunks tervalidasi (exercises + explanations)
+ *             strong  (≥ SIM_STRONG=0.55)  → quick_trick: return langsung
+ *                                            hint_text/speech_text: few-shot context ke LLM
+ *             partial (≥ SIM_PARTIAL=0.40) → few-shot context ke LLM
+ *             weak    (< SIM_PARTIAL)       → corpus miss → log admin_rag_miss
  *
- * Konsekuensi trial: TIDAK ada jawaban gratis dari corpus (quick_trick) — semua
- * pertanyaan premium langsung memakan kuota LLM berbayar. System prompt tetap
- * membatasi topik ke matematika level terkait.
+ * Layer 2 : LLM primary — openai/gpt-4o-mini via OpenRouter (93 key rotasi)
+ *             Dipanggil jika Layer 1 partial atau miss (premium only)
+ *             System prompt: PRIMING_STRUKTUR_BOT_TUTOR_MATEMATIKA_SD.md §7
+ *             Corpus miss → tetap jawab + log admin_rag_miss (jadi backlog materi)
  *
- * Versi produksi (dengan Layer 1 semantic search + Ollama): pipeline.FULL.js
+ * Layer 3 : LLM fallback — gemini-3.1-flash-lite via Google AI (200 key rotasi)
+ *             Dipanggil hanya jika Layer 2 gagal total (rate limit / error)
+ *
+ * Post-LLM : math-validator (mathjs) — verifikasi & koreksi kalkulasi
+ * Post-LLM : normalizer (deterministic) — notasi → ucapan Indonesia
+ * Layer out : output by access level (premium: live TTS, basic: pre-generated audio)
+ *
+ * Catatan arsitektur:
+ *   - Lexical search (ILIKE) dihapus sebagai layer. Terlalu noise untuk corpus tervalidasi.
+ *   - LLM tidak menjawab soal di luar materi kurikulum: system prompt memblok ini.
+ *   - Semua corpus miss dilog ke admin_rag_miss untuk backlog pengembangan materi.
+ *   - Model OpenRouter fallback diupdate: gemini-3.1-flash-lite (preview sudah shutdown Mei 2026)
  */
 
 'use strict';
 
+const http        = require('http');
 const db          = require('../database/db');
 const normalizer  = require('./normalizer');
 const openrouter  = require('./openrouter-client');
@@ -23,8 +37,130 @@ const gemini      = require('./gemini-client');
 const geminiTTS   = require('./gemini-tts');
 const { validateMathAnswer } = require('./math-validator');
 
-// (Trial) Layer 1 semantic search + generateEmbedding + chooseBestChunk dihapus
-// bersama seluruh kode Ollama — lihat pipeline.FULL.js untuk versi lengkap.
+// ── Konfigurasi embedding ─────────────────────────────────────────────────────
+const OLLAMA_HOST   = process.env.OLLAMA_HOST        || 'localhost';
+const OLLAMA_PORT   = parseInt(process.env.OLLAMA_PORT || '11434', 10);
+const OLLAMA_MODEL  = process.env.OLLAMA_EMBED_MODEL || 'bge-m3';
+const EMBED_DIM     = 1024;
+const EMBED_TIMEOUT = parseInt(process.env.OLLAMA_TIMEOUT_MS || '15000', 10);
+
+// Threshold cosine similarity (dikalibrasi dari backtest BGE-M3, 13 Sep 2026)
+// Corpus 14.926 chunks: MRR@10=0.9997, Recall@10=100%
+const SIM_STRONG  = parseFloat(process.env.RAG_SIM_STRONG  || '0.55');
+const SIM_PARTIAL = parseFloat(process.env.RAG_SIM_PARTIAL || '0.40');
+const SEM_TOP_K   = parseInt(process.env.RAG_SEM_TOP_K     || '5', 10);
+
+// ── Embedding via BGE-M3 Ollama ───────────────────────────────────────────────
+async function generateEmbedding(text) {
+  const truncated = String(text || '').slice(0, 512).trim();
+  if (!truncated) return null;
+
+  return new Promise(resolve => {
+    const body = JSON.stringify({ model: OLLAMA_MODEL, prompt: truncated });
+    const req  = http.request(
+      {
+        hostname: OLLAMA_HOST, port: OLLAMA_PORT,
+        path:    '/api/embeddings', method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+        timeout: EMBED_TIMEOUT,
+      },
+      res => {
+        let raw = '';
+        res.on('data', c => (raw += c));
+        res.on('end', () => {
+          try {
+            const p = JSON.parse(raw);
+            resolve(p.embedding?.length === EMBED_DIM ? p.embedding : null);
+          } catch { resolve(null); }
+        });
+      }
+    );
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error',   () => resolve(null));
+    req.write(body); req.end();
+  });
+}
+
+// ── Layer 1: Semantic Search (BGE-M3) ─────────────────────────────────────────
+async function semanticSearch(question, level, conceptId) {
+  try {
+    // Pastikan pgvector tersedia
+    const ext = await db.query("SELECT 1 FROM pg_extension WHERE extname = 'vector'");
+    if (ext.rows.length === 0) {
+      return { hit: 'none', source: 'semantic', results: [], reason: 'pgvector not installed' };
+    }
+
+    const embedding = await generateEmbedding(question);
+    if (!embedding) {
+      return { hit: 'none', source: 'semantic', results: [], reason: 'Ollama down / embedding gagal' };
+    }
+
+    const vecStr = '[' + embedding.map(v => v.toFixed(8)).join(',') + ']';
+
+    // Query: filter by level, sort by cosine distance, prioritas quick_trick
+    const { rows } = await db.query(
+      `SELECT
+         ee.chunk_text,
+         ee.chunk_type,
+         ee.concept_id,
+         ee.exercise_id,
+         ee.explanation_id,
+         ee.level_id,
+         1 - (ee.embedding <=> $1::vector(1024)) AS similarity
+       FROM explanations_embedding ee
+       WHERE ee.level_id = $2
+         AND ee.embedding_ready = true
+       ORDER BY
+         ee.embedding <=> $1::vector(1024),
+         CASE ee.chunk_type
+           WHEN 'quick_trick'  THEN 1
+           WHEN 'hint_text'    THEN 2
+           WHEN 'speech_text'  THEN 3
+           ELSE 4
+         END
+       LIMIT $3`,
+      [vecStr, level, SEM_TOP_K]
+    );
+
+    if (rows.length === 0) {
+      return { hit: 'none', source: 'semantic', results: [] };
+    }
+
+    const topSim = parseFloat(rows[0].similarity);
+
+    if (topSim >= SIM_STRONG) {
+      return { hit: 'strong', source: 'semantic', results: rows, similarity: topSim };
+    }
+    if (topSim >= SIM_PARTIAL) {
+      return { hit: 'partial', source: 'semantic', results: rows, similarity: topSim };
+    }
+    return { hit: 'weak', source: 'semantic', results: rows, similarity: topSim };
+
+  } catch (err) {
+    console.error('[RAG] semanticSearch error:', err.message);
+    return { hit: 'none', source: 'semantic', results: [], reason: err.message };
+  }
+}
+
+/**
+ * Pilih chunk terbaik dari hasil semantic search.
+ * Priority: quick_trick > hint_text > speech_text > lainnya
+ * Jika similarity drop > 0.05 dari top, tetap pakai top.
+ */
+function chooseBestChunk(rows) {
+  if (!rows || rows.length === 0) return null;
+  const topSim = parseFloat(rows[0].similarity);
+  const PRIO   = { quick_trick: 1, hint_text: 2, speech_text: 3 };
+
+  let best = rows[0], bestScore = Infinity;
+  for (const row of rows) {
+    const sim  = parseFloat(row.similarity);
+    if (topSim - sim > 0.05) break;
+    const score = PRIO[row.chunk_type] || 4;
+    if (score < bestScore) { bestScore = score; best = row; }
+  }
+  return best;
+}
 
 // ── Layer 2+3: LLM (OpenRouter primary → Gemini fallback) ────────────────────
 async function llmGenerate(question, level, conceptId, fewShotContext, studentId) {
@@ -123,7 +259,23 @@ async function llmGenerate(question, level, conceptId, fewShotContext, studentId
   };
 }
 
-// (Trial) logRagMiss dihapus bersama Layer 1 — lihat pipeline.FULL.js
+// ── Log corpus miss ke admin_rag_miss ─────────────────────────────────────────
+async function logRagMiss({ studentId, level, question, topSim, topChunkText, llmAnswered, llmModel }) {
+  try {
+    await db.query(
+      `INSERT INTO admin_rag_miss
+         (student_id, level_id, question_text, top_sim_score, top_chunk_text, llm_answered, llm_model)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [studentId || null, level, question,
+       topSim   !== undefined ? topSim : null,
+       topChunkText || null,
+       llmAnswered  || false,
+       llmModel     || null]
+    );
+  } catch (err) {
+    console.warn('[RAG] logRagMiss failed:', err.message);
+  }
+}
 
 // ── System prompt (PRIMING §7) ────────────────────────────────────────────────
 function buildSystemPrompt(level, fewShotContext = []) {
@@ -260,15 +412,50 @@ async function askKak({ studentId, questionText, conceptId, level, accessType })
     return { answer: cached.answer_text, audioUrl: null, source: cached.source, cached: true };
   }
 
-  // (Trial) Tanpa Layer 1 semantic search — semua pertanyaan premium langsung
-  // masuk LLM (OpenRouter → Gemini). few-shot context tidak tersedia.
-  let answerText = null;
-  let source     = null;
-  let llmMeta    = null;
+  let answerText     = null;
+  let source         = null;
+  let fewShotContext = [];
+  let llmMeta        = null;
+  let ragMissLogged  = false;
 
-  // ── Layer 2+3: LLM (premium only) ──────────────────────────────────────────
-  if (accessType === 'premium') {
-    const llmResult = await llmGenerate(questionText, level, conceptId, [], studentId);
+  // ── Layer 1: Semantic Search ───────────────────────────────────────────────
+  const semantic = await semanticSearch(questionText, level, conceptId);
+
+  if (semantic.hit === 'strong') {
+    // Hanya quick_trick yang boleh return langsung sebagai jawaban.
+    // quick_trick dirancang sebagai trik/cara cepat yang berdiri sendiri.
+    // hint_text dan speech_text adalah soal/konteks — tidak tepat dikembalikan
+    // mentah sebagai jawaban karena bisa false positive (angka/konteks beda).
+    const quickTrick = semantic.results.find(r => r.chunk_type === 'quick_trick');
+
+    if (quickTrick) {
+      answerText = quickTrick.chunk_text;
+      source     = 'semantic';
+    } else {
+      // Strong hit tapi tidak ada quick_trick → pakai sebagai few-shot context
+      fewShotContext = semantic.results.slice(0, 3).map(r => r.chunk_text);
+    }
+
+  } else if (semantic.hit === 'partial') {
+    // Simpan sebagai few-shot context untuk LLM
+    fewShotContext = semantic.results.slice(0, 3).map(r => r.chunk_text);
+
+  } else {
+    // weak / none — corpus miss, log ke admin
+    const topResult = semantic.results?.[0];
+    await logRagMiss({
+      studentId, level, question: questionText,
+      topSim:       topResult ? parseFloat(topResult.similarity) : null,
+      topChunkText: topResult?.chunk_text || null,
+      llmAnswered:  false,
+      llmModel:     null,
+    });
+    ragMissLogged = true;
+  }
+
+  // ── Layer 2+3: LLM (premium only, jika belum ada jawaban) ─────────────────
+  if (!answerText && accessType === 'premium') {
+    const llmResult = await llmGenerate(questionText, level, conceptId, fewShotContext, studentId);
 
     if (llmResult.quotaExhausted) {
       return {
@@ -281,6 +468,18 @@ async function askKak({ studentId, questionText, conceptId, level, accessType })
       answerText = llmResult.text;
       source     = 'llm';
       llmMeta    = { model: llmResult.model, layer: llmResult.layer, mathValidation: llmResult.mathValidation };
+
+      // Update log rag_miss jika sebelumnya dicatat sebagai miss
+      if (ragMissLogged) {
+        await db.query(
+          `UPDATE admin_rag_miss
+           SET llm_answered = true, llm_model = $1
+           WHERE student_id = $2 AND level_id = $3
+             AND question_text = $4
+             AND created_at > NOW() - INTERVAL '5 seconds'`,
+          [llmResult.model, studentId || null, level, questionText]
+        ).catch(() => {});
+      }
     }
   }
 
@@ -311,9 +510,22 @@ async function askKak({ studentId, questionText, conceptId, level, accessType })
   };
 }
 
+// ── Health checks ─────────────────────────────────────────────────────────────
+async function checkOllamaHealth() {
+  try {
+    const vec = await generateEmbedding('test');
+    return { ok: vec !== null, dim: vec?.length || 0, model: OLLAMA_MODEL };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
 module.exports = {
   askKak,
+  semanticSearch,
   llmGenerate,
+  generateEmbedding,
+  checkOllamaHealth,
   // alias lama untuk kompatibilitas route yang sudah ada
   openRouterFallback: llmGenerate,
   llmFallback:        llmGenerate,

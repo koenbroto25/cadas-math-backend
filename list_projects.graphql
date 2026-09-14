@@ -1,0 +1,12 @@
+﻿query {
+  project(id: "0bbcaeeb-b461-4cc5-b2dc-6d3890dc0138") {
+    id
+    name
+    environments {
+      edges { node { id name } }
+    }
+    services {
+      edges { node { id name } }
+    }
+  }
+}

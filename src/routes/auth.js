@@ -299,4 +299,54 @@ router.post('/student/link-teacher', verifyToken, requireRole('student'), async 
     res.json({ ok: true, teacher });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+// TAMBAHKAN DUA ENDPOINT INI di auth.js, tepat sebelum baris: module.exports = router;
+
+// -- DEMO PASSCODE (Client) ------------------------------------------------
+// POST /api/auth/demo/redeem  { code }
+router.post('/demo/redeem', async (req, res) => {
+  const { code } = req.body || {};
+  if (!code || String(code).length !== 4)
+    return res.status(400).json({ error: 'Passcode harus 4 digit' });
+  try {
+    const r = await db.query(
+      `SELECT id, label, expires_at FROM demo_passcodes
+       WHERE code = $1 AND is_active = true AND expires_at > NOW()`,
+      [String(code).trim()]
+    );
+    if (r.rowCount === 0)
+      return res.status(404).json({ error: 'Passcode tidak valid atau sudah kadaluarsa' });
+
+    await db.query(
+      `UPDATE demo_passcodes SET redeemed_at = NOW(), redeemed_ip = $1
+       WHERE id = $2 AND redeemed_at IS NULL`,
+      [req.headers['x-forwarded-for'] || req.socket?.remoteAddress || null, r.rows[0].id]
+    );
+
+    const expiresAt = new Date(r.rows[0].expires_at);
+    const ttlSec    = Math.max(60, Math.floor((expiresAt - Date.now()) / 1000));
+    const token = signToken(
+      { role: 'demo', kind: 'client_passcode', label: r.rows[0].label || 'Demo' },
+      `${ttlSec}s`
+    );
+    res.json({
+      ok: true,
+      demo_token: token,
+      label:      r.rows[0].label || 'Demo',
+      expires_at: r.rows[0].expires_at,
+    });
+  } catch (err) {
+    console.error('demo/redeem:', err.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/auth/demo/admin-token  — pakai x-admin-secret header
+router.post('/demo/admin-token', (req, res) => {
+  if (req.headers['x-admin-secret'] !== process.env.ADMIN_SECRET)
+    return res.status(401).json({ error: 'unauthorized' });
+  const token = signToken({ role: 'demo', kind: 'admin', label: 'Admin Demo' }, '30d');
+  res.json({ ok: true, demo_token: token });
+});
+
 module.exports = router;

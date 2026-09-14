@@ -1,0 +1,11 @@
+mutation {
+  projectCreate(input: {
+    name: "cadas-app-backend"
+    workspaceId: "da4fe945-da0d-4adc-ac62-e943b0905122"
+    defaultEnvironmentName: "production"
+  }) {
+    id
+    name
+    environments { edges { node { id name } } }
+  }
+}
