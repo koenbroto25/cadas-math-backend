@@ -239,10 +239,115 @@ function validateMathAnswer(llmText, questionText, exerciseText = '') {
   };
 }
 
+// ─── Integrasi soal-cerita.js (Layer B) ──────────────────────────────────────
+
+// _enrichedOps di-set saat startup via setEnrichedOps()
+let _enrichedOpsForValidator = null;
+
+/**
+ * setEnrichedOps(enrichedOps)
+ * Dipanggil dari startup sequence setelah buildEnrichedSynonyms() selesai.
+ * @param {Map} enrichedOps
+ */
+function setEnrichedOps(enrichedOps) {
+  _enrichedOpsForValidator = enrichedOps;
+}
+
+/**
+ * validateWithWordProblem(llmText, questionText, exerciseText)
+ *
+ * Validasi 3 layer:
+ *   Layer A — extractWordProblem() regex (confidence 0.95/0.85)
+ *   Layer B — extractWordProblemWithStemFallback() (confidence 0.70)
+ *   Layer C — jika keduanya gagal → skip validasi, biarkan LLM
+ *
+ * Threshold koreksi:
+ *   confidence ≥ 0.80 → koreksi teks otomatis
+ *   confidence 0.70–0.79 → log saja, tidak koreksi
+ *   confidence < 0.70 → skip
+ *
+ * @param {string} llmText - jawaban dari LLM
+ * @param {string} questionText - pertanyaan siswa
+ * @param {string} [exerciseText] - teks soal dari DB (lebih presisi jika ada)
+ * @returns {object} validationResult
+ */
+function validateWithWordProblem(llmText, questionText, exerciseText = '') {
+  const { extractWordProblem, extractWordProblemWithStemFallback } = require('./soal-cerita');
+  const source = exerciseText || questionText;
+
+  // Layer A: regex pattern
+  let wp = extractWordProblem(source);
+
+  // Layer B: stem fallback (jika Layer A gagal)
+  if (!wp.found && _enrichedOpsForValidator) {
+    wp = extractWordProblemWithStemFallback(source, _enrichedOpsForValidator);
+  }
+
+  // Layer C: keduanya gagal → skip validasi
+  if (!wp.found || wp.answer === null) {
+    return { validated: false, reason: 'no_math_detected_all_layers', llmText };
+  }
+
+  const willCorrect = (wp.confidence || 0) >= 0.80;
+  const llmNumbers  = extractNumbersFromText(llmText);
+  const cmp         = compareAnswers(llmNumbers, wp.answer);
+
+  if (!cmp.found) {
+    return {
+      validated: true, hasNumbers: false, correct: null,
+      correctAnswer: formatResult(wp.answer), expr: wp.expr,
+      confidence: wp.confidence, tier: wp.tier, llmText,
+    };
+  }
+
+  if (cmp.correct) {
+    return {
+      validated: true, hasNumbers: true, correct: true,
+      correctAnswer: formatResult(wp.answer), llmAnswer: formatResult(cmp.llmAnswer),
+      expr: wp.expr, confidence: wp.confidence, tier: wp.tier, llmText,
+    };
+  }
+
+  // LLM salah
+  if (!willCorrect) {
+    // confidence 0.70 (Layer B) → log saja, jangan koreksi otomatis
+    console.warn(
+      `[MathValidator] Kemungkinan salah (confidence ${wp.confidence}, tier ${wp.tier}):`,
+      `${wp.expr} = ${wp.answer}, LLM: ${cmp.llmAnswer} — tidak dikoreksi`
+    );
+    return {
+      validated: true, hasNumbers: true, correct: null,
+      correctAnswer: formatResult(wp.answer), llmAnswer: formatResult(cmp.llmAnswer),
+      expr: wp.expr, confidence: wp.confidence, tier: wp.tier,
+      note: 'low_confidence_no_correction', llmText,
+    };
+  }
+
+  // confidence ≥ 0.80 → koreksi teks
+  const correctStr = formatResult(wp.answer);
+  const wrongStr   = formatResult(cmp.llmAnswer);
+  const corrected  = llmText.trimEnd() +
+    `\n\n⚠️ Koreksi: jawaban yang benar untuk ${wp.expr} adalah **${correctStr}**, bukan ${wrongStr}.`;
+
+  console.warn(
+    `[MathValidator] Koreksi (confidence ${wp.confidence}, tier ${wp.tier}):`,
+    `${wp.expr} = ${wp.answer}, LLM bilang ${cmp.llmAnswer}`
+  );
+
+  return {
+    validated: true, hasNumbers: true, correct: false,
+    correctAnswer: correctStr, llmAnswer: wrongStr,
+    expr: wp.expr, confidence: wp.confidence, tier: wp.tier,
+    llmText: corrected, originalText: llmText,
+  };
+}
+
 module.exports = {
   validateMathAnswer,
   extractMathFromQuestion,
   extractNumbersFromText,
   compareAnswers,
   calcExpression,
+  setEnrichedOps,
+  validateWithWordProblem,
 };

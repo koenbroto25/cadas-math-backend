@@ -4,7 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "node src/index.js",
+    "startCommand": "node src/database/migrate.js && node src/index.js",
     "healthcheckPath": "/api/health",
     "healthcheckTimeout": 30,
     "restartPolicyType": "ON_FAILURE",

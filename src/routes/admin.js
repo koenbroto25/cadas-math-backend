@@ -61,7 +61,13 @@ function requireAdmin(req, res, next) {
   }
   next();
 }
-router.use(requireAdmin);
+// DEMO-PASSCODES dikecualikan: pakai allowAdminOrMarketing (admin ATAU marketing).
+// Tanpa ini, router.use(requireAdmin) memblokir token marketing sebelum
+// sampai ke handler demo (bug: DemoHomeScreen generate passcode selalu 401).
+router.use((req, res, next) => {
+  if (req.path.startsWith('/demo-passcodes')) return next();
+  return requireAdmin(req, res, next);
+});
 
 // ?? Helper: baca referral_settings dari DB ???????????????????????????????????
 async function getSettings() {

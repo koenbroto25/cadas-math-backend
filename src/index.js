@@ -120,6 +120,29 @@ app.get('/api/bot-viseme/:file', (req, res) => {
   res.status(404).json({ error: 'bot viseme tidak tersedia' });
 });
 
+// Sprint Audio — BGM & SFX paket cadas-audio (cadas-sounds.md Bagian 4)
+// Primary: redirect ke R2 /audio/bgm|sfx/*.opus  Fallback: file lokal
+// (dipakai bila R2_PUBLIC_URL belum diisi / untuk development offline).
+app.get('/api/bgm/:file', (req, res) => {
+  if (!/^[A-Za-z0-9_\-]+$/.test(req.params.file)) {
+    return res.status(400).json({ error: 'file tidak valid' });
+  }
+  if (R2_URL) return res.redirect(302, R2_URL + '/audio/bgm/' + req.params.file + '.opus');
+  const file = path.join(SPEED_MASTER, 'audio', 'bgm', req.params.file + '.opus');
+  if (fs.existsSync(file)) return res.sendFile(file);
+  res.status(404).json({ error: 'bgm belum tersedia' });
+});
+
+app.get('/api/sfx/:file', (req, res) => {
+  if (!/^[A-Za-z0-9_\-]+$/.test(req.params.file)) {
+    return res.status(400).json({ error: 'file tidak valid' });
+  }
+  if (R2_URL) return res.redirect(302, R2_URL + '/audio/sfx/' + req.params.file + '.opus');
+  const file = path.join(SPEED_MASTER, 'audio', 'sfx', req.params.file + '.opus');
+  if (fs.existsSync(file)) return res.sendFile(file);
+  res.status(404).json({ error: 'sfx belum tersedia' });
+});
+
 // Health check
 app.get('/api/health', async (req, res) => {
   try {
@@ -135,6 +158,25 @@ app.get('/api/health', async (req, res) => {
     res.status(500).json({ status: 'ERROR', database: 'disconnected', error: err.message });
   }
 });
+
+// Startup: build enriched vocabulary dari DB exercises (sekali saat server start).
+// Graceful: jika gagal, semua modul tetap jalan dengan base hardcode id-math-synonyms.js.
+const { buildEnrichedSynonyms } = require('./rag/corpus-vocab-builder');
+const { init: initSoalCerita }  = require('./rag/soal-cerita');
+const { initQueryProcessor }    = require('./rag/query-processor');
+const { setEnrichedOps }        = require('./rag/math-validator');
+
+(async () => {
+  try {
+    const enriched = await buildEnrichedSynonyms();
+    initSoalCerita(enriched.opSynonyms, null);   // Layer B deteksi operasi soal cerita
+    setEnrichedOps(enriched.opSynonyms);         // Layer B koreksi math-validator
+    initQueryProcessor(enriched);                // enriched synonyms query-processor
+    console.log('[Startup] ✅ Enriched vocab siap:', enriched.stats);
+  } catch (err) {
+    console.warn('[Startup] ⚠️ Vocab enrichment gagal — pakai base hardcode:', err.message);
+  }
+})();
 
 app.listen(PORT, () => {
   console.log(`Cadas backend running on port ${PORT}`);
