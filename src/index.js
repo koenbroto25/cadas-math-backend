@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
@@ -81,17 +81,37 @@ app.get('/d/:token', async (req, res) => {
   res.redirect(302, dest);
 });
 
-// TTS per-soal cache + Viseme + Bot Audio â€” Sprint H.4
-// Primary: redirect ke R2 Opus; Fallback: lokal WAV
+// Sprint H.4 - Asset serving (VM-local)
+// Prioritas: file lokal di ASSETS_ROOT (layout mirror bucket R2) ->
+// fallback layout legacy speed-master -> R2 redirect (HANYA bila
+// R2_PUBLIC_URL diisi). Untuk 100% lokal VM: hapus/kosongkan R2_PUBLIC_URL.
+const ASSETS_ROOT = process.env.ASSETS_ROOT || SPEED_MASTER;
 const R2_URL = process.env.R2_PUBLIC_URL || '';
+
+function sendLocal(res, candidates) {
+  for (const f of candidates) {
+    if (fs.existsSync(f)) {
+      if (f.endsWith('.opus')) res.setHeader('Content-Type', 'audio/ogg');
+      res.sendFile(f);
+      return true;
+    }
+  }
+  return false;
+}
+
+const localOpus = (...p) => path.join(ASSETS_ROOT, ...p);
+const legacyAudio = (...p) => path.join(SPEED_MASTER, 'audio', ...p);
+
 app.get('/api/tts/:id', (req, res) => {
   const type = ['hint', 'trick'].includes(req.query.type) ? req.query.type : 'hint';
   if (!/^[A-Za-z0-9_\-]+$/.test(req.params.id)) {
     return res.status(400).json({ error: 'id tidak valid' });
   }
+  if (sendLocal(res, [
+    localOpus('speech', 'cache', 'opus', req.params.id + '_' + type + '.opus'),
+    legacyAudio('speech', 'cache', req.params.id + '_' + type + '.wav'),
+  ])) return;
   if (R2_URL) return res.redirect(302, R2_URL + '/speech/cache/opus/' + req.params.id + '_' + type + '.opus');
-  const file = path.join(SPEED_MASTER, 'audio', 'speech', 'cache', req.params.id + '_' + type + '.wav');
-  if (fs.existsSync(file)) return res.sendFile(file);
   res.status(404).json({ error: 'audio belum tersedia' });
 });
 
@@ -100,9 +120,11 @@ app.get('/api/viseme/:id', (req, res) => {
   if (!/^[A-Za-z0-9_\-]+$/.test(req.params.id)) {
     return res.status(400).json({ error: 'id tidak valid' });
   }
+  if (sendLocal(res, [
+    localOpus('speech', 'cache', 'visemes', req.params.id + '_' + type + '.json'),
+    legacyAudio('speech', 'cache', 'visemes', req.params.id + '_' + type + '.json'),
+  ])) return;
   if (R2_URL) return res.redirect(302, R2_URL + '/speech/cache/visemes/' + req.params.id + '_' + type + '.json');
-  const file = path.join(SPEED_MASTER, 'audio', 'speech', 'cache', 'visemes', req.params.id + '_' + type + '.json');
-  if (fs.existsSync(file)) return res.sendFile(file);
   res.status(404).json({ error: 'viseme belum tersedia' });
 });
 
@@ -110,29 +132,38 @@ app.get('/api/bot-audio/:file', (req, res) => {
   if (!/^[A-Za-z0-9_\-]+$/.test(req.params.file)) {
     return res.status(400).json({ error: 'file tidak valid' });
   }
+  if (sendLocal(res, [
+    localOpus('bot', 'speech', 'opus', req.params.file + '.opus'),
+    legacyAudio('bot', 'speech', 'opus', req.params.file + '.opus'),
+  ])) return;
   if (R2_URL) return res.redirect(302, R2_URL + '/bot/speech/opus/' + req.params.file + '.opus');
   res.status(404).json({ error: 'bot audio tidak tersedia' });
 });
 
-// Sprint H.7 â€” Bot viseme endpoint (R2 redirect ke /bot/speech/visemes/)
+// Sprint H.7 - Bot viseme endpoint (/bot/speech/visemes/)
 app.get('/api/bot-viseme/:file', (req, res) => {
   if (!/^[A-Za-z0-9_\-]+$/.test(req.params.file)) {
     return res.status(400).json({ error: 'file tidak valid' });
   }
+  if (sendLocal(res, [
+    localOpus('bot', 'speech', 'visemes', req.params.file + '.json'),
+    legacyAudio('bot', 'speech', 'visemes', req.params.file + '.json'),
+  ])) return;
   if (R2_URL) return res.redirect(302, R2_URL + '/bot/speech/visemes/' + req.params.file + '.json');
   res.status(404).json({ error: 'bot viseme tidak tersedia' });
 });
 
-// Sprint Audio â€” BGM & SFX paket cadas-audio (cadas-sounds.md Bagian 4)
-// Primary: redirect ke R2 /audio/bgm|sfx/*.opus  Fallback: file lokal
-// (dipakai bila R2_PUBLIC_URL belum diisi / untuk development offline).
+// Sprint Audio - BGM & SFX paket cadas-audio (cadas-sounds.md Bagian 4)
+// Primary: file lokal Opus. Fallback: R2 redirect (bila R2_PUBLIC_URL diisi).
 app.get('/api/bgm/:file', (req, res) => {
   if (!/^[A-Za-z0-9_\-]+$/.test(req.params.file)) {
     return res.status(400).json({ error: 'file tidak valid' });
   }
+  if (sendLocal(res, [
+    localOpus('audio', 'bgm', req.params.file + '.opus'),
+    legacyAudio('bgm', req.params.file + '.opus'),
+  ])) return;
   if (R2_URL) return res.redirect(302, R2_URL + '/audio/bgm/' + req.params.file + '.opus');
-  const file = path.join(SPEED_MASTER, 'audio', 'bgm', req.params.file + '.opus');
-  if (fs.existsSync(file)) return res.sendFile(file);
   res.status(404).json({ error: 'bgm belum tersedia' });
 });
 
@@ -140,9 +171,11 @@ app.get('/api/sfx/:file', (req, res) => {
   if (!/^[A-Za-z0-9_\-]+$/.test(req.params.file)) {
     return res.status(400).json({ error: 'file tidak valid' });
   }
+  if (sendLocal(res, [
+    localOpus('audio', 'sfx', req.params.file + '.opus'),
+    legacyAudio('sfx', req.params.file + '.opus'),
+  ])) return;
   if (R2_URL) return res.redirect(302, R2_URL + '/audio/sfx/' + req.params.file + '.opus');
-  const file = path.join(SPEED_MASTER, 'audio', 'sfx', req.params.file + '.opus');
-  if (fs.existsSync(file)) return res.sendFile(file);
   res.status(404).json({ error: 'sfx belum tersedia' });
 });
 
