@@ -17,3 +17,15 @@ scripts/backup-r2-assets.js
 scripts/complete-visemes.js
 clean-mojibake.js
 check-jsx.js
+
+# Local secrets and deployment artifacts (never publish)
+.env*
+*.pem
+*.key
+*.p12
+.railway/
+data_dump/
+upload_*.js
+railway_deploy_status.js
+*.lnk
+

@@ -158,6 +158,9 @@ async function lexicalSearch(question, level, conceptId) {
  * Priority: quick_trick > hint_text > speech_text > explanation
  */
 async function semanticSearch(question, level, conceptId) {
+  if (process.env.RAG_SEMANTIC_ENABLED !== 'true') {
+    return { hit: 'none', source: 'semantic', results: [], reason: 'semantic search disabled' };
+  }
   try {
     const vectorCheck = await db.query(
       "SELECT extname FROM pg_extension WHERE extname = 'vector'"

@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
@@ -8,7 +8,10 @@ const db = require('./database/db');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const SPEED_MASTER = path.join('D:', 'local-rag-voice-bot', 'speed-math-master');
+const SPEED_MASTER = process.env.ASSET_ROOT || (process.platform === 'win32'
+  ? path.join('D:', 'local-rag-voice-bot', 'speed-math-master')
+  : path.join(__dirname, '..', 'data'));
+app.set('trust proxy', 'loopback');
 
 app.use(cors());
 app.use(express.json());
@@ -33,7 +36,7 @@ app.use('/api/midtrans',    require('./routes/midtrans'));   // Sprint D.2 - mid
 
 // Sprint F.5 - /api/config: konfigurasi dinamis untuk mobile (public, tanpa auth)
 // Aplikasi fetch endpoint ini saat startup, simpan ke store/AsyncStorage.
-// Update nilai di sini (atau .env backend) → restart backend → app ikut berubah TANPA rebuild APK.
+// Update nilai di sini (atau .env backend) â†’ restart backend â†’ app ikut berubah TANPA rebuild APK.
 app.get('/api/config', (req, res) => {
   res.json({
     apiVersion:  '1.0.0',
@@ -41,7 +44,7 @@ app.get('/api/config', (req, res) => {
     pwaUrl:      process.env.PWA_URL      || 'https://cadasmatematika.id',
     r2PublicUrl: process.env.R2_PUBLIC_URL || null,
     adminWhatsapp: process.env.ADMIN_WHATSAPP || null,
-    // Flag kontrol fitur — tambahkan sesuai kebutuhan:
+    // Flag kontrol fitur â€” tambahkan sesuai kebutuhan:
     // maintenanceMode, minSupportedVersion, ttsEnabled, dsb.
   });
 });
@@ -78,7 +81,7 @@ app.get('/d/:token', async (req, res) => {
   res.redirect(302, dest);
 });
 
-// TTS per-soal cache + Viseme + Bot Audio — Sprint H.4
+// TTS per-soal cache + Viseme + Bot Audio â€” Sprint H.4
 // Primary: redirect ke R2 Opus; Fallback: lokal WAV
 const R2_URL = process.env.R2_PUBLIC_URL || '';
 app.get('/api/tts/:id', (req, res) => {
@@ -111,7 +114,7 @@ app.get('/api/bot-audio/:file', (req, res) => {
   res.status(404).json({ error: 'bot audio tidak tersedia' });
 });
 
-// Sprint H.7 — Bot viseme endpoint (R2 redirect ke /bot/speech/visemes/)
+// Sprint H.7 â€” Bot viseme endpoint (R2 redirect ke /bot/speech/visemes/)
 app.get('/api/bot-viseme/:file', (req, res) => {
   if (!/^[A-Za-z0-9_\-]+$/.test(req.params.file)) {
     return res.status(400).json({ error: 'file tidak valid' });
@@ -120,7 +123,7 @@ app.get('/api/bot-viseme/:file', (req, res) => {
   res.status(404).json({ error: 'bot viseme tidak tersedia' });
 });
 
-// Sprint Audio — BGM & SFX paket cadas-audio (cadas-sounds.md Bagian 4)
+// Sprint Audio â€” BGM & SFX paket cadas-audio (cadas-sounds.md Bagian 4)
 // Primary: redirect ke R2 /audio/bgm|sfx/*.opus  Fallback: file lokal
 // (dipakai bila R2_PUBLIC_URL belum diisi / untuk development offline).
 app.get('/api/bgm/:file', (req, res) => {
@@ -172,13 +175,13 @@ const { setEnrichedOps }        = require('./rag/math-validator');
     initSoalCerita(enriched.opSynonyms, null);   // Layer B deteksi operasi soal cerita
     setEnrichedOps(enriched.opSynonyms);         // Layer B koreksi math-validator
     initQueryProcessor(enriched);                // enriched synonyms query-processor
-    console.log('[Startup] ✅ Enriched vocab siap:', enriched.stats);
+    console.log('[Startup] âœ… Enriched vocab siap:', enriched.stats);
   } catch (err) {
-    console.warn('[Startup] ⚠️ Vocab enrichment gagal — pakai base hardcode:', err.message);
+    console.warn('[Startup] âš ï¸ Vocab enrichment gagal â€” pakai base hardcode:', err.message);
   }
 })();
 
-app.listen(PORT, () => {
+app.listen(PORT, process.env.HOST || '0.0.0.0', () => {
   console.log(`Cadas backend running on port ${PORT}`);
 });
 
