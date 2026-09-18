@@ -14,7 +14,7 @@ const SECRET       = process.env.JWT_SECRET || 'cadas_app_secure_secret_key_2026
 
 // -- STUDENT --------------------------------------------------------------
 // POST /api/auth/student/register  { name, kelas, referral_code? }
-// referral_code opsional � dikirim frontend jika siswa datang via link /d/:token
+// referral_code opsional � dikirim frontend jika siswa datang via link /d/:token
 router.post('/student/register', async (req, res) => {
   const { name, kelas, referral_code } = req.body || {};
   if (!name || typeof name !== 'string' || name.trim().length < 2)
@@ -269,7 +269,7 @@ router.get('/me', verifyToken, (req, res) => {
 });
 
 
-// GET /api/auth/teacher/by-code/:code  � public, murid cari guru by kode
+// GET /api/auth/teacher/by-code/:code  � public, murid cari guru by kode
 router.get('/teacher/by-code/:code', async (req, res) => {
   try {
     const r = await db.query(
@@ -281,7 +281,7 @@ router.get('/teacher/by-code/:code', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST /api/auth/student/link-teacher  { teacher_code }  � butuh JWT student
+// POST /api/auth/student/link-teacher  { teacher_code }  � butuh JWT student
 router.post('/student/link-teacher', verifyToken, requireRole('student'), async (req, res) => {
   try {
     const { teacher_code } = req.body || {};
@@ -341,12 +341,55 @@ router.post('/demo/redeem', async (req, res) => {
   }
 });
 
-// POST /api/auth/demo/admin-token  � pakai x-admin-secret header
+// POST /api/auth/demo/admin-token  � pakai x-admin-secret header
 router.post('/demo/admin-token', (req, res) => {
   if (req.headers['x-admin-secret'] !== process.env.ADMIN_SECRET)
     return res.status(401).json({ error: 'unauthorized' });
-  const token = signToken({ role: 'demo', kind: 'admin', label: 'Admin Demo' }, '30d');
+  const token = signToken({ role: 'demo', kind: 'admin', label: 'Admin Demo' }, '30m');
   res.json({ ok: true, demo_token: token });
+});
+
+// ─ ADMIN LOGIN (full access untuk owner/developer, bukan demo) ──────────
+// POST /api/auth/admin/login  { email, password }
+// Kredensial dari .env: ADMIN_EMAIL + ADMIN_PASSWORD_HASH (bcrypt).
+// Fallback plain: ADMIN_EMAIL + ADMIN_PASSWORD (untuk setup awal).
+router.post('/admin/login', async (req, res) => {
+  const { email, password } = req.body || {};
+  const adminEmail = process.env.ADMIN_EMAIL;
+  const hash       = process.env.ADMIN_PASSWORD_HASH;
+  const plain      = process.env.ADMIN_PASSWORD;
+
+  if (!adminEmail || (!hash && !plain))
+    return res.status(503).json({ error: 'Admin login belum dikonfigurasi di server' });
+
+  const emailOk = String(email || '').trim().toLowerCase()
+                === String(adminEmail).trim().toLowerCase();
+
+  let passOk = false;
+  try {
+    if (hash) {
+      const bcrypt = require('bcryptjs');
+      passOk = await bcrypt.compare(String(password || ''), hash);
+    } else {
+      passOk = String(password || '') === String(plain);
+    }
+  } catch (_) { passOk = false; }
+
+  if (!emailOk || !passOk)
+    return res.status(401).json({ error: 'Email atau password admin salah' });
+
+  // TTL 8 jam: cukup untuk sesi kerja/QA, tidak permanen.
+  const token = signToken({ role: 'admin', kind: 'full', email: adminEmail }, '8h');
+  res.json({ ok: true, admin_token: token, profile: { email: adminEmail, role: 'admin' } });
+});
+
+// GET /api/auth/admin/me  — validasi sesi admin (Bearer)
+router.get('/admin/me', (req, res) => {
+  verifyToken(req, res, () => {
+    if (!req.auth || req.auth.role !== 'admin')
+      return res.status(403).json({ error: 'bukan admin' });
+    res.json({ ok: true, profile: { email: req.auth.email, role: 'admin' } });
+  });
 });
 
 module.exports = router;

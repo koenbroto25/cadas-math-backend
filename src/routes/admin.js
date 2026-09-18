@@ -24,10 +24,20 @@ const db      = require('../database/db');
 const SECRET_KEY = process.env.JWT_SECRET || 'cadas_app_secure_secret_key_2026';
 
 
+// Helper: Bearer token dengan role 'admin' (login app, TTL 8 jam)
+function isAdminBearer(req) {
+  const header = req.headers.authorization || '';
+  const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return false;
+  try {
+    return jwt.verify(token, SECRET_KEY).role === 'admin';
+  } catch (_) { return false; }
+}
+
 // Middleware: izinkan admin (x-admin-secret) ATAU referrer marketing (Bearer token)
 function allowAdminOrMarketing(req, res, next) {
-  // Admin via header secret
-  if (req.headers['x-admin-secret'] === process.env.ADMIN_SECRET) {
+  // Admin via header secret ATAU Bearer role admin
+  if (req.headers['x-admin-secret'] === process.env.ADMIN_SECRET || isAdminBearer(req)) {
     req.demoCallerKind = 'admin';
     return next();
   }
@@ -54,9 +64,9 @@ const jwt     = require('jsonwebtoken');
 
 const SECRET = process.env.JWT_SECRET || 'cadas_app_secure_secret_key_2026';
 
-// Middleware admin (x-admin-secret header)
+// Middleware admin: x-admin-secret header (script/curl) ATAU Bearer role admin (app)
 function requireAdmin(req, res, next) {
-  if (req.headers['x-admin-secret'] !== process.env.ADMIN_SECRET) {
+  if (req.headers['x-admin-secret'] !== process.env.ADMIN_SECRET && !isAdminBearer(req)) {
     return res.status(401).json({ error: 'unauthorized' });
   }
   next();
