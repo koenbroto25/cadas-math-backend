@@ -42,7 +42,7 @@ router.get('/children', async (req, res) => {
       WHERE pc.parent_id = $1
       GROUP BY s.id
       ORDER BY s.display_name
-    `, [req.auth.sub]);
+    `, [req.auth.id]);
 
     res.json({ children: rows.rows });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -51,7 +51,7 @@ router.get('/children', async (req, res) => {
 // GET /api/parent/child/:student_id/progress
 router.get('/child/:student_id/progress', async (req, res) => {
   try {
-    if (!await ownedByParent(req.auth.sub, req.params.student_id)) {
+    if (!await ownedByParent(req.auth.id, req.params.student_id)) {
       return res.status(403).json({ error: 'akses ditolak' });
     }
 
@@ -106,7 +106,7 @@ router.get('/child/:student_id/progress', async (req, res) => {
 // GET /api/parent/child/:student_id/sessions?page=1&limit=20
 router.get('/child/:student_id/sessions', async (req, res) => {
   try {
-    if (!await ownedByParent(req.auth.sub, req.params.student_id)) {
+    if (!await ownedByParent(req.auth.id, req.params.student_id)) {
       return res.status(403).json({ error: 'akses ditolak' });
     }
 
@@ -144,7 +144,7 @@ router.get('/child/:student_id/sessions', async (req, res) => {
 // GET /api/parent/child/:student_id/billing
 router.get('/child/:student_id/billing', async (req, res) => {
   try {
-    if (!await ownedByParent(req.auth.sub, req.params.student_id)) {
+    if (!await ownedByParent(req.auth.id, req.params.student_id)) {
       return res.status(403).json({ error: 'akses ditolak' });
     }
 

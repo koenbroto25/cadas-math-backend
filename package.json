@@ -16,6 +16,7 @@
     "dotenv": "^16.4.5",
     "edge-tts": "^1.0.1",
     "express": "^4.19.2",
+    "html-pdf-node": "^1.0.8",
     "jsonwebtoken": "^9.0.2",
     "mathjs": "^15.2.0",
     "pg": "^8.11.3",

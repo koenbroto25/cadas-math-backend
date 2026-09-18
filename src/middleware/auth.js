@@ -35,4 +35,21 @@ function requireRole(...roles) {
   };
 }
 
-module.exports = { signToken, verifyToken, requireRole };
+// requireAuth: verifikasi token (via verifyToken sudah jalan), mapping req.auth → req.user
+function requireAuth(req, res, next) {
+  if (!req.auth) {
+    return res.status(401).json({ error: 'token tidak ada atau tidak valid' });
+  }
+  req.user = req.auth;
+  next();
+}
+
+// requireParent: role harus 'parent'
+function requireParent(req, res, next) {
+  if (!req.auth || req.auth.role !== 'parent') {
+    return res.status(403).json({ error: 'akses hanya untuk role parent' });
+  }
+  next();
+}
+
+module.exports = { signToken, verifyToken, requireRole, requireAuth, requireParent };

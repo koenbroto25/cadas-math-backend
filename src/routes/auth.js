@@ -1,395 +1,358 @@
 /**
- * FASE 3.1 - Auth: register/login 3 role + Parent Gate.
+ * routes/auth.js — Sistem Auth Baru Cadas Matematika
+ * Phase 1+3: display_id, parent_phone, parent_children, add-child, card-shared
+ * Backward compatible — endpoint lama tetap berfungsi
  */
-const express = require('express');
-const bcrypt  = require('bcryptjs');
-const crypto  = require('crypto');
-const jwt     = require('jsonwebtoken');
-const db      = require('../database/db');
-const { signToken, verifyToken, requireRole } = require('../middleware/auth');
 
-const router       = express.Router();
-const BCRYPT_ROUNDS = 10;
-const SECRET       = process.env.JWT_SECRET || 'cadas_app_secure_secret_key_2026';
+const express  = require('express');
+const bcrypt   = require('bcryptjs');
+const jwt      = require('jsonwebtoken');
+const db       = require('../database/db');
+const { requireAuth, requireParent } = require('../middleware/auth');
+const { generateDisplayId, normalizeDisplayId, normalizePhone } = require('../utils/studentId');
 
-// -- STUDENT --------------------------------------------------------------
-// POST /api/auth/student/register  { name, kelas, referral_code? }
-// referral_code opsional � dikirim frontend jika siswa datang via link /d/:token
+const router = express.Router();
+
+const JWT_SECRET  = process.env.JWT_SECRET;
+const ADMIN_SECRET = process.env.ADMIN_SECRET;
+
+// ── Helper ────────────────────────────────────────────────────────────────────
+
+function signToken(payload, expiresIn = '90d') {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn });
+}
+
+async function checkDisplayIdExists(id) {
+  const r = await db.query('SELECT 1 FROM students WHERE display_id = $1', [id]);
+  return r.rowCount > 0;
+}
+
+async function linkParentChild(parentId, studentId) {
+  await db.query(
+    `INSERT INTO parent_children (parent_id, student_id)
+     VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+    [parentId, studentId]
+  );
+}
+
+async function getLinkedChildren(parentId) {
+  const r = await db.query(
+    `SELECT s.id, s.display_id, s.name, s.kelas, s.current_level,
+            s.card_shared, s.parent_phone
+     FROM students s
+     JOIN parent_children pc ON pc.student_id = s.id
+     WHERE pc.parent_id = $1
+     ORDER BY pc.linked_at ASC`,
+    [parentId]
+  );
+  return r.rows;
+}
+
+// ── STUDENT — Register ────────────────────────────────────────────────────────
+
 router.post('/student/register', async (req, res) => {
-  const { name, kelas, referral_code } = req.body || {};
-  if (!name || typeof name !== 'string' || name.trim().length < 2)
-    return res.status(400).json({ error: 'name wajib diisi (min 2 karakter)' });
-  const grade = parseInt(kelas, 10);
-  if (!Number.isInteger(grade) || grade < 1 || grade > 9)
-    return res.status(400).json({ error: 'kelas harus angka 1-9' });
   try {
-    // Resolve referral_code ? referrer id (jika ada dan aktif)
-    let referredBy = null;
-    if (referral_code && typeof referral_code === 'string') {
-      const ref = await db.query(
-        `SELECT id, type, is_active FROM referrers
-         WHERE referral_code = $1 AND status = 'approved' AND is_active = true`,
-        [referral_code.trim().toUpperCase()]
+    const { name, kelas, parent_phone } = req.body;
+
+    if (!name?.trim() || name.trim().length < 2)
+      return res.status(400).json({ error: 'Nama minimal 2 karakter.' });
+
+    const k = parseInt(kelas, 10);
+    if (!k || k < 1 || k > 9)
+      return res.status(400).json({ error: 'Kelas harus 1-9.' });
+
+    // Generate display_id unik
+    const display_id = await generateDisplayId(checkDisplayIdExists);
+
+    // Normalisasi phone jika ada
+    const phone_normalized = parent_phone ? normalizePhone(parent_phone) : null;
+
+    const r = await db.query(
+      `INSERT INTO students (name, kelas, display_id, parent_phone)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, name, kelas, display_id, parent_phone, current_level`,
+      [name.trim(), k, display_id, phone_normalized]
+    );
+    const student = r.rows[0];
+    const token   = signToken({ id: student.id, role: 'student' });
+
+    return res.json({ token, student });
+  } catch (err) {
+    console.error('[auth/student/register]', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// ── STUDENT — Login ───────────────────────────────────────────────────────────
+
+router.post('/student/login', async (req, res) => {
+  try {
+    // Support login via display_id (B7KM) ATAU student_id lama (UUID)
+    const { student_id, display_id: rawDisplayId } = req.body;
+
+    let student = null;
+
+    if (rawDisplayId) {
+      const did = normalizeDisplayId(rawDisplayId);
+      if (!did) return res.status(400).json({ error: 'Format ID tidak valid. Gunakan 4 karakter seperti B7KM.' });
+      const r = await db.query(
+        `SELECT id, name, kelas, display_id, current_level, card_shared
+         FROM students WHERE display_id = $1`, [did]
       );
-      if (ref.rowCount > 0) referredBy = ref.rows[0].id;
+      student = r.rows[0];
+    } else if (student_id) {
+      // Backward compat — login via UUID lama
+      const r = await db.query(
+        `SELECT id, name, kelas, display_id, current_level, card_shared
+         FROM students WHERE id = $1`, [student_id]
+      );
+      student = r.rows[0];
+    } else {
+      return res.status(400).json({ error: 'Kirim display_id (B7KM) atau student_id.' });
     }
 
-    const username = `siswa_${crypto.randomBytes(4).toString('hex')}`;
-    const r = await db.query(
-      `INSERT INTO students (username, display_name, grade_level, current_level, trial_level, referred_by)
-       VALUES ($1, $2, $3, 1, 1, $4)
-       RETURNING id, username, display_name AS name, grade_level AS kelas, current_level`,
-      [username, name.trim(), grade, referredBy]
-    );
-    const student = r.rows[0];
-    res.status(201).json({
-      student_id: student.id,
-      student,
-      referral_attached: referredBy !== null,
-      token: signToken({ sub: student.id, role: 'student' }),
-    });
+    if (!student) return res.status(404).json({ error: 'Akun tidak ditemukan.' });
+
+    const token = signToken({ id: student.id, role: 'student' });
+    return res.json({ token, student });
   } catch (err) {
-    console.error('student/register:', err.message);
-    res.status(500).json({ error: 'gagal mendaftarkan siswa' });
+    console.error('[auth/student/login]', err);
+    return res.status(500).json({ error: 'Server error.' });
   }
 });
 
-// POST /api/auth/student/login  { student_id }
-router.post('/student/login', async (req, res) => {
-  const { student_id } = req.body || {};
-  if (!student_id || typeof student_id !== 'string')
-    return res.status(400).json({ error: 'student_id wajib diisi' });
+// ── STUDENT — Mark card shared ────────────────────────────────────────────────
+
+router.patch('/student/card-shared', requireAuth, async (req, res) => {
+  try {
+    const { shared_via } = req.body; // 'whatsapp' | 'pdf' | 'copy'
+    const studentId = req.user.id;
+
+    await db.query(
+      `UPDATE students
+       SET card_shared = true, card_shared_at = now()
+       WHERE id = $1`,
+      [studentId]
+    );
+
+    // Log channel yang dipakai (opsional, untuk analytics)
+    if (shared_via) {
+      await db.query(
+        `INSERT INTO events (student_id, event_type, meta)
+         VALUES ($1, 'card_shared', $2)
+         ON CONFLICT DO NOTHING`,
+        [studentId, JSON.stringify({ via: shared_via })]
+      ).catch(() => {}); // non-blocking, tabel events mungkin belum ada
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[auth/student/card-shared]', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// ── STUDENT — Get card data (untuk re-share dari Settings) ───────────────────
+
+router.get('/student/card', requireAuth, async (req, res) => {
   try {
     const r = await db.query(
-      `SELECT id, username, display_name AS name, grade_level AS kelas,
-              current_level, trial_level, paid_basic_up_to_level, paid_premium_up_to_level
+      `SELECT id, name, kelas, display_id, current_level, card_shared,
+              card_shared_at, parent_phone
        FROM students WHERE id = $1`,
-      [student_id]
+      [req.user.id]
     );
-    if (r.rowCount === 0) return res.status(404).json({ error: 'siswa tidak ditemukan' });
+    if (!r.rows[0]) return res.status(404).json({ error: 'Tidak ditemukan.' });
+
     const student = r.rows[0];
-    res.json({ student_id: student.id, student, token: signToken({ sub: student.id, role: 'student' }) });
+
+    // Cek apakah sudah ada orang tua yang terhubung
+    const parentR = await db.query(
+      `SELECT p.id, p.name FROM parents p
+       JOIN parent_children pc ON pc.parent_id = p.id
+       WHERE pc.student_id = $1 LIMIT 1`,
+      [student.id]
+    );
+    student.parent_linked = parentR.rowCount > 0;
+    student.parent_name   = parentR.rows[0]?.name || null;
+
+    return res.json(student);
   } catch (err) {
-    console.error('student/login:', err.message);
-    res.status(500).json({ error: 'gagal login' });
+    console.error('[auth/student/card]', err);
+    return res.status(500).json({ error: 'Server error.' });
   }
 });
 
-// -- PARENT ---------------------------------------------------------------
-// POST /api/auth/parent/register  { name, email?, phone?, password }
+// ── PARENT — Register ─────────────────────────────────────────────────────────
+
 router.post('/parent/register', async (req, res) => {
-  const { name, email, phone, password } = req.body || {};
-  if (!name || typeof name !== 'string' || name.trim().length < 2)
-    return res.status(400).json({ error: 'name wajib diisi' });
-  if (!email && !phone)
-    return res.status(400).json({ error: 'email atau phone wajib diisi salah satu' });
-  if (!password || typeof password !== 'string' || password.length < 6)
-    return res.status(400).json({ error: 'password wajib diisi (min 6 karakter)' });
   try {
-    const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    const { name, email, password, phone, child_id } = req.body;
+
+    if (!name?.trim())  return res.status(400).json({ error: 'Nama wajib diisi.' });
+    if (!email?.trim()) return res.status(400).json({ error: 'Email wajib diisi.' });
+    if (!password || password.length < 6)
+      return res.status(400).json({ error: 'Password minimal 6 karakter.' });
+    if (!phone?.trim()) return res.status(400).json({ error: 'Nomor HP wajib diisi.' });
+
+    const phone_normalized = normalizePhone(phone);
+    if (!phone_normalized)
+      return res.status(400).json({ error: 'Format nomor HP tidak valid.' });
+
+    // Cek duplikat email
+    const emailCheck = await db.query(
+      'SELECT id FROM parents WHERE email = $1', [email.trim().toLowerCase()]
+    );
+    if (emailCheck.rowCount > 0)
+      return res.status(409).json({ error: 'Email sudah terdaftar.' });
+
+    const hashed = await bcrypt.hash(password, 10);
+
     const r = await db.query(
-      `INSERT INTO parents (phone, email, display_name, password_hash)
+      `INSERT INTO parents (name, email, password_hash, phone)
        VALUES ($1, $2, $3, $4)
-       RETURNING id, display_name, email, phone`,
-      [phone || null, email || null, name.trim(), hash]
+       RETURNING id, name, email, phone`,
+      [name.trim(), email.trim().toLowerCase(), hashed, phone_normalized]
     );
     const parent = r.rows[0];
-    res.status(201).json({
-      parent_id: parent.id,
-      parent,
-      token: signToken({ sub: parent.id, role: 'parent' }),
-    });
+
+    // ── Auto-link via child_id (Jalur A/B) ──
+    let linked_children = [];
+    if (child_id) {
+      const did = normalizeDisplayId(child_id);
+      if (did) {
+        const sr = await db.query(
+          'SELECT id FROM students WHERE display_id = $1', [did]
+        );
+        if (sr.rows[0]) {
+          await linkParentChild(parent.id, sr.rows[0].id);
+        }
+      }
+    }
+
+    // ── Auto-link via phone matching (Jalur C) — jika child_id tidak ada ──
+    if (!child_id && phone_normalized) {
+      const sr = await db.query(
+        'SELECT id FROM students WHERE parent_phone = $1', [phone_normalized]
+      );
+      for (const student of sr.rows) {
+        await linkParentChild(parent.id, student.id);
+      }
+    }
+
+    linked_children = await getLinkedChildren(parent.id);
+    const token = signToken({ id: parent.id, role: 'parent' });
+
+    return res.json({ token, parent, linked_children });
   } catch (err) {
-    if (String(err.message).includes('uq_parents_email') || String(err.message).includes('parents_phone_key'))
-      return res.status(409).json({ error: 'email/phone sudah terdaftar' });
-    console.error('parent/register:', err.message);
-    res.status(500).json({ error: 'gagal mendaftarkan parent' });
+    console.error('[auth/parent/register]', err);
+    return res.status(500).json({ error: 'Server error.' });
   }
 });
 
-// POST /api/auth/parent/login  { email?, phone?, password }
+// ── PARENT — Login ────────────────────────────────────────────────────────────
+
 router.post('/parent/login', async (req, res) => {
-  const { email, phone, password } = req.body || {};
-  if ((!email && !phone) || !password)
-    return res.status(400).json({ error: 'email/phone + password wajib diisi' });
   try {
+    const { email, password } = req.body;
+    if (!email || !password)
+      return res.status(400).json({ error: 'Email dan password wajib diisi.' });
+
     const r = await db.query(
-      `SELECT id, display_name, password_hash FROM parents
-       WHERE email = $1 OR phone = $1`,
-      [email || phone]
+      'SELECT id, name, email, password_hash, phone FROM parents WHERE email = $1',
+      [email.trim().toLowerCase()]
     );
-    if (r.rowCount === 0) return res.status(401).json({ error: 'kredensial salah' });
-    const ok = await bcrypt.compare(password, r.rows[0].password_hash || '');
-    if (!ok) return res.status(401).json({ error: 'kredensial salah' });
-    res.json({
-      parent_id: r.rows[0].id,
-      parent: { id: r.rows[0].id, display_name: r.rows[0].display_name },
-      token: signToken({ sub: r.rows[0].id, role: 'parent' }),
-    });
+    const parent = r.rows[0];
+    if (!parent) return res.status(404).json({ error: 'Akun tidak ditemukan.' });
+
+    const valid = await bcrypt.compare(password, parent.password_hash);
+    if (!valid) return res.status(401).json({ error: 'Password salah.' });
+
+    const linked_children = await getLinkedChildren(parent.id);
+    const token = signToken({ id: parent.id, role: 'parent' });
+
+    return res.json({ token, parent: { id: parent.id, name: parent.name, email: parent.email, phone: parent.phone }, linked_children });
   } catch (err) {
-    console.error('parent/login:', err.message);
-    res.status(500).json({ error: 'gagal login' });
+    console.error('[auth/parent/login]', err);
+    return res.status(500).json({ error: 'Server error.' });
   }
 });
 
-// POST /api/auth/parent/link-child  { student_id }
-router.post('/parent/link-child', verifyToken, requireRole('parent'), async (req, res) => {
-  const { student_id } = req.body || {};
-  if (!student_id) return res.status(400).json({ error: 'student_id wajib diisi' });
+// ── PARENT — Add child ke akun yang sudah ada ─────────────────────────────────
+
+router.post('/parent/add-child', requireAuth, requireParent, async (req, res) => {
   try {
-    const s = await db.query(
-      'SELECT id, display_name, current_level, trial_level FROM students WHERE id = $1',
-      [student_id]
+    const { child_id } = req.body;
+    if (!child_id) return res.status(400).json({ error: 'child_id wajib diisi.' });
+
+    const did = normalizeDisplayId(child_id);
+    if (!did) return res.status(400).json({ error: 'Format ID tidak valid (contoh: B7KM).' });
+
+    const sr = await db.query(
+      'SELECT id, name, kelas, display_id, current_level FROM students WHERE display_id = $1',
+      [did]
     );
-    if (s.rowCount === 0) return res.status(404).json({ error: 'siswa tidak ditemukan' });
-    await db.query(
-      'INSERT INTO parent_children (parent_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-      [req.auth.sub, student_id]
-    );
-    res.json({ ok: true, student: s.rows[0] });
+    if (!sr.rows[0]) return res.status(404).json({ error: 'Siswa dengan ID tersebut tidak ditemukan.' });
+
+    await linkParentChild(req.user.id, sr.rows[0].id);
+    const linked_children = await getLinkedChildren(req.user.id);
+
+    return res.json({ ok: true, linked_children });
   } catch (err) {
-    console.error('parent/link-child:', err.message);
-    res.status(500).json({ error: 'gagal menghubungkan akun' });
+    console.error('[auth/parent/add-child]', err);
+    return res.status(500).json({ error: 'Server error.' });
   }
 });
 
-// -- TEACHER --------------------------------------------------------------
-// POST /api/auth/teacher/register  { name, email, password, teacher_type }
-router.post('/teacher/register', async (req, res) => {
-  const { name, email, password, teacher_type } = req.body || {};
-  if (!name || !email) return res.status(400).json({ error: 'name + email wajib diisi' });
-  if (!password || password.length < 6)
-    return res.status(400).json({ error: 'password wajib diisi (min 6 karakter)' });
-  if (!['school', 'private'].includes(teacher_type))
-    return res.status(400).json({ error: "teacher_type harus 'school' atau 'private'" });
+// ── PARENT — Get children list ────────────────────────────────────────────────
+
+router.get('/parent/children', requireAuth, requireParent, async (req, res) => {
   try {
-    const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-    const r = await db.query(
-      `INSERT INTO teachers (email, display_name, teacher_type, password_hash, is_verified)
-       VALUES ($1, $2, $3, $4, FALSE)
-       RETURNING id, display_name, email, teacher_type, is_verified`,
-      [email.toLowerCase(), name.trim(), teacher_type, hash]
-    );
-    const teacher = r.rows[0];
-    res.status(201).json({
-      teacher_id: teacher.id,
-      teacher,
-      verified: false,
-      token: signToken({ sub: teacher.id, role: 'teacher', verified: false }),
-    });
+    const children = await getLinkedChildren(req.user.id);
+    return res.json({ children });
   } catch (err) {
-    if (String(err.message).includes('teachers_email_key') || String(err.message).includes('duplicate'))
-      return res.status(409).json({ error: 'email sudah terdaftar' });
-    console.error('teacher/register:', err.message);
-    res.status(500).json({ error: 'gagal mendaftarkan guru' });
+    console.error('[auth/parent/children]', err);
+    return res.status(500).json({ error: 'Server error.' });
   }
 });
 
-// POST /api/auth/teacher/login  { email, password }
-router.post('/teacher/login', async (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ error: 'email + password wajib' });
-  try {
-    const r = await db.query(
-      `SELECT id, display_name, teacher_type, is_verified, password_hash
-       FROM teachers WHERE email = $1`,
-      [String(email).toLowerCase()]
-    );
-    if (r.rowCount === 0) return res.status(401).json({ error: 'kredensial salah' });
-    const t  = r.rows[0];
-    const ok = await bcrypt.compare(password, t.password_hash || '');
-    if (!ok) return res.status(401).json({ error: 'kredensial salah' });
-    res.json({
-      teacher_id:   t.id,
-      teacher: {
-        id:          t.id,
-        display_name: t.display_name,
-        teacher_type: t.teacher_type,
-        verified:    t.is_verified,
-      },
-      display_name: t.display_name,
-      name:         t.display_name,
-      teacher_type: t.teacher_type,
-      verified:     t.is_verified,
-      token: signToken({ sub: t.id, role: 'teacher', verified: t.is_verified }),
-    });
-  } catch (err) {
-    console.error('teacher/login:', err.message);
-    res.status(500).json({ error: 'gagal login' });
-  }
-});
+// ── DEMO — Passcode (endpoint lama, tetap ada) ────────────────────────────────
 
-// POST /api/auth/teacher/link-student  { student_id }
-router.post('/teacher/link-student', verifyToken, requireRole('teacher'), async (req, res) => {
-  try {
-    const { student_id } = req.body || {};
-    if (!student_id) return res.status(400).json({ error: 'student_id wajib diisi' });
-    const s = await db.query(
-      'SELECT id, display_name, current_level, trial_level FROM students WHERE id = $1',
-      [student_id]
-    );
-    if (s.rowCount === 0) return res.status(404).json({ error: 'siswa tidak ditemukan' });
-    await db.query(
-      'INSERT INTO teacher_students (teacher_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-      [req.auth.sub, student_id]
-    );
-    res.json({ ok: true, student: s.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// -- PARENT GATE ----------------------------------------------------------
-// GET /api/auth/parent-gate/challenge
-router.get('/parent-gate/challenge', (req, res) => {
-  const a = 2 + Math.floor(Math.random() * 8);
-  const b = 2 + Math.floor(Math.random() * 8);
-  const challengeToken = jwt.sign({ ans: a * b, kind: 'gate_challenge' }, SECRET, { expiresIn: '2m' });
-  res.json({ challenge_token: challengeToken, question: `${a} x ${b} = ?` });
-});
-
-// POST /api/auth/parent-gate/verify  { challenge_token, answer }
-router.post('/parent-gate/verify', (req, res) => {
-  const { challenge_token, answer } = req.body || {};
-  if (!challenge_token || answer === undefined)
-    return res.status(400).json({ error: 'challenge_token + answer wajib' });
-  try {
-    const payload = jwt.verify(challenge_token, SECRET);
-    if (payload.kind !== 'gate_challenge')
-      return res.status(401).json({ error: 'challenge tidak valid' });
-    if (Number(answer) !== Number(payload.ans))
-      return res.status(401).json({ error: 'jawaban salah' });
-    res.json({ gate_token: signToken({ kind: 'gate_pass' }, '15m') });
-  } catch {
-    return res.status(401).json({ error: 'challenge kedaluwarsa' });
-  }
-});
-
-// GET /api/auth/me
-router.get('/me', verifyToken, (req, res) => {
-  res.json({ auth: req.auth });
-});
-
-
-// GET /api/auth/teacher/by-code/:code  � public, murid cari guru by kode
-router.get('/teacher/by-code/:code', async (req, res) => {
-  try {
-    const r = await db.query(
-      'SELECT id, display_name, teacher_type, teacher_code FROM teachers WHERE teacher_code = $1',
-      [req.params.code.toUpperCase().trim()]
-    );
-    if (r.rowCount === 0) return res.status(404).json({ error: 'Kode guru tidak ditemukan' });
-    res.json({ teacher: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// POST /api/auth/student/link-teacher  { teacher_code }  � butuh JWT student
-router.post('/student/link-teacher', verifyToken, requireRole('student'), async (req, res) => {
-  try {
-    const { teacher_code } = req.body || {};
-    if (!teacher_code) return res.status(400).json({ error: 'teacher_code wajib diisi' });
-    const t = await db.query(
-      'SELECT id, display_name, teacher_type FROM teachers WHERE teacher_code = $1',
-      [teacher_code.toUpperCase().trim()]
-    );
-    if (t.rowCount === 0) return res.status(404).json({ error: 'Kode guru tidak ditemukan' });
-    const teacher = t.rows[0];
-    await db.query(
-      'INSERT INTO teacher_students (teacher_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-      [teacher.id, req.auth.sub]
-    );
-    res.json({ ok: true, teacher });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// TAMBAHKAN DUA ENDPOINT INI di auth.js, tepat sebelum baris: module.exports = router;
-
-// -- DEMO PASSCODE (Client) ------------------------------------------------
-// POST /api/auth/demo/redeem  { code }
 router.post('/demo/redeem', async (req, res) => {
-  const { code } = req.body || {};
-  if (!code || String(code).length !== 4)
-    return res.status(400).json({ error: 'Passcode harus 4 digit' });
   try {
+    const { code } = req.body;
+    if (!code || String(code).length !== 4 || isNaN(Number(code)))
+      return res.status(400).json({ error: 'Passcode harus 4 angka.' });
+
     const r = await db.query(
       `SELECT id, label, expires_at FROM demo_passcodes
-       WHERE code = $1 AND is_active = true AND expires_at > NOW()`,
-      [String(code).trim()]
+       WHERE code = $1 AND is_active = true AND expires_at > now()`,
+      [String(code)]
     );
-    if (r.rowCount === 0)
-      return res.status(404).json({ error: 'Passcode tidak valid atau sudah kadaluarsa' });
+    if (!r.rows[0]) return res.status(404).json({ error: 'Passcode tidak valid atau sudah kadaluarsa.' });
 
-    await db.query(
-      `UPDATE demo_passcodes SET redeemed_at = NOW(), redeemed_ip = $1
-       WHERE id = $2 AND redeemed_at IS NULL`,
-      [req.headers['x-forwarded-for'] || req.socket?.remoteAddress || null, r.rows[0].id]
-    );
+    const { label, expires_at } = r.rows[0];
+    const token = signToken({ role: 'demo', kind: 'client', label }, '30d');
 
-    const expiresAt = new Date(r.rows[0].expires_at);
-    const ttlSec    = Math.max(60, Math.floor((expiresAt - Date.now()) / 1000));
-    const token = signToken(
-      { role: 'demo', kind: 'client_passcode', label: r.rows[0].label || 'Demo' },
-      `${ttlSec}s`
-    );
-    res.json({
-      ok: true,
-      demo_token: token,
-      label:      r.rows[0].label || 'Demo',
-      expires_at: r.rows[0].expires_at,
-    });
+    return res.json({ ok: true, token, label, expires_at });
   } catch (err) {
-    console.error('demo/redeem:', err.message);
-    res.status(500).json({ error: 'Server error' });
+    console.error('[auth/demo/redeem]', err);
+    return res.status(500).json({ error: 'Server error.' });
   }
 });
 
-// POST /api/auth/demo/admin-token  � pakai x-admin-secret header
-router.post('/demo/admin-token', (req, res) => {
-  if (req.headers['x-admin-secret'] !== process.env.ADMIN_SECRET)
-    return res.status(401).json({ error: 'unauthorized' });
-  const token = signToken({ role: 'demo', kind: 'admin', label: 'Admin Demo' }, '30m');
-  res.json({ ok: true, demo_token: token });
-});
-
-// ─ ADMIN LOGIN (full access untuk owner/developer, bukan demo) ──────────
-// POST /api/auth/admin/login  { email, password }
-// Kredensial dari .env: ADMIN_EMAIL + ADMIN_PASSWORD_HASH (bcrypt).
-// Fallback plain: ADMIN_EMAIL + ADMIN_PASSWORD (untuk setup awal).
-router.post('/admin/login', async (req, res) => {
-  const { email, password } = req.body || {};
-  const adminEmail = process.env.ADMIN_EMAIL;
-  const hash       = process.env.ADMIN_PASSWORD_HASH;
-  const plain      = process.env.ADMIN_PASSWORD;
-
-  if (!adminEmail || (!hash && !plain))
-    return res.status(503).json({ error: 'Admin login belum dikonfigurasi di server' });
-
-  const emailOk = String(email || '').trim().toLowerCase()
-                === String(adminEmail).trim().toLowerCase();
-
-  let passOk = false;
+router.post('/demo/admin-token', async (req, res) => {
   try {
-    if (hash) {
-      const bcrypt = require('bcryptjs');
-      passOk = await bcrypt.compare(String(password || ''), hash);
-    } else {
-      passOk = String(password || '') === String(plain);
-    }
-  } catch (_) { passOk = false; }
+    const secret = req.headers['x-admin-secret'];
+    if (!secret || secret !== ADMIN_SECRET)
+      return res.status(403).json({ error: 'Forbidden.' });
 
-  if (!emailOk || !passOk)
-    return res.status(401).json({ error: 'Email atau password admin salah' });
-
-  // TTL 8 jam: cukup untuk sesi kerja/QA, tidak permanen.
-  const token = signToken({ role: 'admin', kind: 'full', email: adminEmail }, '8h');
-  res.json({ ok: true, admin_token: token, profile: { email: adminEmail, role: 'admin' } });
-});
-
-// GET /api/auth/admin/me  — validasi sesi admin (Bearer)
-router.get('/admin/me', (req, res) => {
-  verifyToken(req, res, () => {
-    if (!req.auth || req.auth.role !== 'admin')
-      return res.status(403).json({ error: 'bukan admin' });
-    res.json({ ok: true, profile: { email: req.auth.email, role: 'admin' } });
-  });
+    const token = signToken({ role: 'demo', kind: 'admin', label: 'Admin Demo' }, '30d');
+    return res.json({ ok: true, demo_token: token });
+  } catch (err) {
+    console.error('[auth/demo/admin-token]', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
 });
 
 module.exports = router;

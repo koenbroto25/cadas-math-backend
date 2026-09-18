@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
@@ -22,6 +22,7 @@ app.use('/audio',     express.static(path.join(SPEED_MASTER, 'audio')));
 
 // Routes
 app.use('/api/auth',         require('./routes/auth'));
+app.use('/api/card',         require('./routes/card'));
 app.use('/api/exercises',    require('./routes/exercises'));
 app.use('/api/progress',     require('./routes/progress'));
 app.use('/api/placement',    require('./routes/placement'));
@@ -36,7 +37,7 @@ app.use('/api/midtrans',    require('./routes/midtrans'));   // Sprint D.2 - mid
 
 // Sprint F.5 - /api/config: konfigurasi dinamis untuk mobile (public, tanpa auth)
 // Aplikasi fetch endpoint ini saat startup, simpan ke store/AsyncStorage.
-// Update nilai di sini (atau .env backend) â†’ restart backend â†’ app ikut berubah TANPA rebuild APK.
+// Update nilai di sini (atau .env backend) Ã¢â€ â€™ restart backend Ã¢â€ â€™ app ikut berubah TANPA rebuild APK.
 app.get('/api/config', (req, res) => {
   res.json({
     apiVersion:  '1.0.0',
@@ -44,7 +45,7 @@ app.get('/api/config', (req, res) => {
     pwaUrl:      process.env.PWA_URL      || 'https://cadasmatematika.id',
     r2PublicUrl: process.env.R2_PUBLIC_URL || null,
     adminWhatsapp: process.env.ADMIN_WHATSAPP || null,
-    // Flag kontrol fitur â€” tambahkan sesuai kebutuhan:
+    // Flag kontrol fitur Ã¢â‚¬â€ tambahkan sesuai kebutuhan:
     // maintenanceMode, minSupportedVersion, ttsEnabled, dsb.
   });
 });
@@ -208,9 +209,9 @@ const { setEnrichedOps }        = require('./rag/math-validator');
     initSoalCerita(enriched.opSynonyms, null);   // Layer B deteksi operasi soal cerita
     setEnrichedOps(enriched.opSynonyms);         // Layer B koreksi math-validator
     initQueryProcessor(enriched);                // enriched synonyms query-processor
-    console.log('[Startup] âœ… Enriched vocab siap:', enriched.stats);
+    console.log('[Startup] Ã¢Å“â€¦ Enriched vocab siap:', enriched.stats);
   } catch (err) {
-    console.warn('[Startup] âš ï¸ Vocab enrichment gagal â€” pakai base hardcode:', err.message);
+    console.warn('[Startup] Ã¢Å¡Â Ã¯Â¸Â Vocab enrichment gagal Ã¢â‚¬â€ pakai base hardcode:', err.message);
   }
 })();
 
@@ -219,4 +220,5 @@ app.listen(PORT, process.env.HOST || '0.0.0.0', () => {
 });
 
 module.exports = app;
+
 
