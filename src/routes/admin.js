@@ -732,7 +732,7 @@ router.get('/demo-passcodes', allowAdminOrMarketing, async (req, res) => {
 });
 
 router.post('/demo-passcodes', allowAdminOrMarketing, async (req, res) => {
-  // Body opsional: { label: "Demo SMP Banjarbaru", hours: 4 }
+  // Body opsional: { label: "Demo SMP Banjarbaru", hours: 0.5 }
   const { label, hours } = req.body || {};
   // Jika caller adalah referrer, pastikan type = marketing
   if (req.demoCallerKind === 'referrer') {
@@ -743,7 +743,8 @@ router.post('/demo-passcodes', allowAdminOrMarketing, async (req, res) => {
       }
     } catch (e) { return res.status(500).json({ error: e.message }); }
   }
-  const ttlHours = Math.min(72, Math.max(1, parseInt(hours) || 2));
+  // Minimal 0.5 jam (30 menit) — passcode demo = full premium, jangan lama-lama (biaya LLM)
+  const ttlHours = Math.min(72, Math.max(0.5, parseFloat(hours) || 0.5));
   try {
     let code, inserted = false;
     // Coba sampai dapat kode unik (max 10x)
