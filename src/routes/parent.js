@@ -28,7 +28,7 @@ router.get('/children', async (req, res) => {
   try {
     const rows = await db.query(`
       SELECT
-        s.id, s.username, s.display_name, s.grade_level,
+        s.id, COALESCE(s.name, s.display_name) AS display_name, COALESCE(s.kelas, s.grade_level) AS grade_level,
         s.current_level, s.trial_level,
         s.paid_basic_up_to_level, s.paid_premium_up_to_level,
         s.created_at,
@@ -41,7 +41,7 @@ router.get('/children', async (req, res) => {
       LEFT JOIN student_sessions ss ON ss.student_id = s.id
       WHERE pc.parent_id = $1
       GROUP BY s.id
-      ORDER BY s.display_name
+      ORDER BY display_name
     `, [req.auth.id]);
 
     res.json({ children: rows.rows });
@@ -56,7 +56,7 @@ router.get('/child/:student_id/progress', async (req, res) => {
     }
 
     const s = await db.query(`
-      SELECT id, display_name, grade_level, current_level, trial_level,
+      SELECT id, COALESCE(name, display_name) AS display_name, COALESCE(kelas, grade_level) AS grade_level, current_level, trial_level,
              paid_basic_up_to_level, paid_premium_up_to_level, created_at
       FROM students WHERE id = $1
     `, [req.params.student_id]);
@@ -149,7 +149,7 @@ router.get('/child/:student_id/billing', async (req, res) => {
     }
 
     const s = await db.query(`
-      SELECT id, display_name, current_level,
+      SELECT id, COALESCE(name, display_name) AS display_name, current_level,
              paid_basic_up_to_level, paid_premium_up_to_level
       FROM students WHERE id = $1
     `, [req.params.student_id]);

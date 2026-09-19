@@ -3,21 +3,28 @@
  * GET  /api/card/student/:studentId   → PDF (auth: student atau parent)
  * GET  /api/card/my                   → PDF milik student yang sedang login
  *
- * Gunakan library: puppeteer-core + @sparticuz/chromium (sudah ringan di Node)
- * Install: npm install puppeteer-core @sparticuz/chromium
- *
- * Alternatif ringan: npm install html-pdf-node
- * Ganti fungsi generatePdf() di bawah jika pakai alternatif.
+ * FIX 2026-09-18:
+ *  - P0-1: requireAuth kini verifikasi token sendiri (lihat middleware).
+ *  - P0-4: dukung ?token= khusus endpoint ini (allowQueryToken) agar
+ *    PlacementCardModal bisa buka PDF via Linking tanpa header.
+ *    Catatan keamanan: token tetap JWT penuh; risiko bocor via URL history
+ *    diterima utk MVP; upgrade ke one-time ticket bila perlu.
+ *  - P1-5: PDF generator hanya html-pdf-node (sudah di package.json).
+ *    Hapus jalur puppeteer agar tidak ada log error menyesatkan.
+ *  - D1/A1: SELECT pakai COALESCE agar baris lama tetap jalan.
+ *  - D4: APP_BASE_URL default https://cadasmatematika.web.id.
  */
 
 const express  = require('express');
-const path     = require('path');
 const db       = require('../database/db');
 const { requireAuth } = require('../middleware/auth');
 
 const router = express.Router();
 
 const APP_BASE_URL = process.env.APP_BASE_URL || 'https://cadasmatematika.web.id';
+
+// Aktifkan dukungan ?token= hanya untuk router ini (lihat middleware/auth.js).
+router.use((req, res, next) => { req.allowQueryToken = true; next(); });
 
 // ── Level name map ─────────────────────────────────────────────────────────────
 const LEVEL_NAMES = {
@@ -37,7 +44,7 @@ function buildCardHtml(student) {
   const levelName  = LEVEL_NAMES[current_level] || `Level ${current_level}`;
   const parentLink = `${APP_BASE_URL}/parent/join?ref=${display_id}`;
   // Tampilkan ID dengan spasi antar karakter
-  const idSpaced   = display_id.split('').join('  ');
+  const idSpaced   = (display_id || "").split('').join('  ');
   // Fonetik sederhana (huruf dibaca nama, angka dibaca angka)
   const phoneticMap = {
     A:'A',B:'Be',C:'Ce',D:'De',E:'E',F:'Ef',G:'Ge',H:'Ha',
@@ -45,7 +52,7 @@ function buildCardHtml(student) {
     S:'Es',T:'Te',U:'U',V:'Ve',W:'We',X:'Eks',Y:'Ye',Z:'Zet',
     2:'dua',3:'tiga',4:'empat',5:'lima',6:'enam',7:'tujuh',8:'delapan',9:'sembilan',
   };
-  const phonetic = display_id.split('').map(c => phoneticMap[c] || c).join(' ');
+  const phonetic = (display_id || "").split('').map(c => phoneticMap[c] || c).join(' ');
 
   return `<!DOCTYPE html>
 <html lang="id">
@@ -139,52 +146,23 @@ function buildCardHtml(student) {
 
 // ── PDF generator (html-pdf-node — paling ringan, tidak butuh Chromium) ───────
 async function generatePdf(html) {
-  try {
-    // Coba html-pdf-node dulu (ringan)
-    const htmlPdf = require('html-pdf-node');
-    const file    = { content: html };
-    const options = {
-      format: 'A6',
-      landscape: true,
-      margin: { top: 0, right: 0, bottom: 0, left: 0 },
-      printBackground: true,
-    };
-    return await htmlPdf.generatePdf(file, options);
-  } catch (e1) {
-    // Fallback: puppeteer-core + @sparticuz/chromium
-    try {
-      const puppeteer = require('puppeteer-core');
-      const chromium  = require('@sparticuz/chromium');
-      const browser = await puppeteer.launch({
-        args:            chromium.args,
-        defaultViewport: chromium.defaultViewport,
-        executablePath:  await chromium.executablePath(),
-        headless:        chromium.headless,
-      });
-      const page = await browser.newPage();
-      await page.setContent(html, { waitUntil: 'networkidle0' });
-      await page.setViewport({ width: 600, height: 380 });
-      const pdf = await page.pdf({
-        width:           '600px',
-        height:          '380px',
-        printBackground: true,
-      });
-      await browser.close();
-      return pdf;
-    } catch (e2) {
-      console.error('[card/generatePdf] Kedua library gagal:', e1.message, e2.message);
-      throw new Error('PDF generator tidak tersedia. Install html-pdf-node atau puppeteer-core.');
-    }
-  }
+  const htmlPdf = require('html-pdf-node');
+  const file    = { content: html };
+  const options = {
+    format: 'A6',
+    landscape: true,
+    margin: { top: 0, right: 0, bottom: 0, left: 0 },
+    printBackground: true,
+  };
+  return await htmlPdf.generatePdf(file, options);
 }
 
-// ── GET /api/card/my — PDF milik student yang login ───────────────────────────
 router.get('/my', requireAuth, async (req, res) => {
   if (req.user.role !== 'student')
     return res.status(403).json({ error: 'Hanya untuk student.' });
   try {
     const r = await db.query(
-      `SELECT id, name, kelas, display_id, current_level
+      `SELECT id, COALESCE(name, display_name) AS name, COALESCE(kelas, grade_level) AS kelas, display_id, current_level
        FROM students WHERE id = $1`, [req.user.id]
     );
     if (!r.rows[0]) return res.status(404).json({ error: 'Tidak ditemukan.' });
@@ -211,7 +189,7 @@ router.get('/student/:displayId', requireAuth, async (req, res) => {
   try {
     const { displayId } = req.params;
     const r = await db.query(
-      `SELECT id, name, kelas, display_id, current_level
+      `SELECT id, COALESCE(name, display_name) AS name, COALESCE(kelas, grade_level) AS kelas, display_id, current_level
        FROM students WHERE display_id = $1`,
       [displayId.toUpperCase()]
     );
@@ -248,5 +226,6 @@ router.get('/student/:displayId', requireAuth, async (req, res) => {
     return res.status(500).json({ error: err.message || 'Server error.' });
   }
 });
+
 
 module.exports = router;

@@ -2,25 +2,26 @@
  * routes/auth.js — Sistem Auth Baru Cadas Matematika
  * Phase 1+3: display_id, parent_phone, parent_children, add-child, card-shared
  * Backward compatible — endpoint lama tetap berfungsi
+ *
+ * FIX 2026-09-18 (sinkron Neon, Opsi A1):
+ *  - Kolom display (name/kelas/parents.name) dari migrasi 019; semua SELECT
+ *    pakai COALESCE agar baris lama (display_name/grade_level) tetap jalan.
+ *  - JWT via middleware signToken (satu SECRET + fail-fast production).
+ *  - Tambah POST /parent/merge-account (D3, wajib): gabung akun lama ke aktif.
  */
 
 const express  = require('express');
 const bcrypt   = require('bcryptjs');
 const jwt      = require('jsonwebtoken');
 const db       = require('../database/db');
-const { requireAuth, requireParent } = require('../middleware/auth');
+const { requireAuth, requireParent, signToken } = require('../middleware/auth');
 const { generateDisplayId, normalizeDisplayId, normalizePhone } = require('../utils/studentId');
 
 const router = express.Router();
 
-const JWT_SECRET  = process.env.JWT_SECRET;
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
 
 // ── Helper ────────────────────────────────────────────────────────────────────
-
-function signToken(payload, expiresIn = '90d') {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn });
-}
 
 async function checkDisplayIdExists(id) {
   const r = await db.query('SELECT 1 FROM students WHERE display_id = $1', [id]);
@@ -37,8 +38,10 @@ async function linkParentChild(parentId, studentId) {
 
 async function getLinkedChildren(parentId) {
   const r = await db.query(
-    `SELECT s.id, s.display_id, s.name, s.kelas, s.current_level,
-            s.card_shared, s.parent_phone
+    `SELECT s.id, s.display_id,
+            COALESCE(s.name, s.display_name) AS name,
+            COALESCE(s.kelas, s.grade_level) AS kelas,
+            s.current_level, s.card_shared, s.parent_phone
      FROM students s
      JOIN parent_children pc ON pc.student_id = s.id
      WHERE pc.parent_id = $1
@@ -47,6 +50,14 @@ async function getLinkedChildren(parentId) {
   );
   return r.rows;
 }
+
+// Baris student untuk respons publik (lama + baru digabung).
+const STUDENT_PUBLIC_COLS = `
+  id,
+  COALESCE(name, display_name) AS name,
+  COALESCE(kelas, grade_level) AS kelas,
+  display_id, current_level, card_shared
+`;
 
 // ── STUDENT — Register ────────────────────────────────────────────────────────
 
@@ -68,15 +79,23 @@ router.post('/student/register', async (req, res) => {
     const phone_normalized = parent_phone ? normalizePhone(parent_phone) : null;
 
     const r = await db.query(
-      `INSERT INTO students (name, kelas, display_id, parent_phone)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, name, kelas, display_id, parent_phone, current_level`,
+      `INSERT INTO students (name, kelas, display_id, parent_phone, display_name, grade_level)
+       VALUES ($1, $2, $3, $4, $1, $2)
+       RETURNING id, name,
+                 COALESCE(kelas, grade_level) AS kelas,
+                 display_id, parent_phone, current_level`,
       [name.trim(), k, display_id, phone_normalized]
     );
     const student = r.rows[0];
     const token   = signToken({ id: student.id, role: 'student' });
 
-    return res.json({ token, student });
+    // Respons lengkap untuk frontend v3 (StudentRegisterScreen):
+    // data.student.display_id dipakai untuk RegisterSuccessView + kartu identitas.
+    return res.status(201).json({
+      token,
+      student_id: student.id,
+      student: { ...student, card_shared: false },
+    });
   } catch (err) {
     console.error('[auth/student/register]', err);
     return res.status(500).json({ error: 'Server error.' });
@@ -96,14 +115,14 @@ router.post('/student/login', async (req, res) => {
       const did = normalizeDisplayId(rawDisplayId);
       if (!did) return res.status(400).json({ error: 'Format ID tidak valid. Gunakan 4 karakter seperti B7KM.' });
       const r = await db.query(
-        `SELECT id, name, kelas, display_id, current_level, card_shared
+        `SELECT id, COALESCE(name, display_name) AS name, COALESCE(kelas, grade_level) AS kelas, display_id, current_level, card_shared
          FROM students WHERE display_id = $1`, [did]
       );
       student = r.rows[0];
     } else if (student_id) {
       // Backward compat — login via UUID lama
       const r = await db.query(
-        `SELECT id, name, kelas, display_id, current_level, card_shared
+        `SELECT id, COALESCE(name, display_name) AS name, COALESCE(kelas, grade_level) AS kelas, display_id, current_level, card_shared
          FROM students WHERE id = $1`, [student_id]
       );
       student = r.rows[0];
@@ -157,7 +176,7 @@ router.patch('/student/card-shared', requireAuth, async (req, res) => {
 router.get('/student/card', requireAuth, async (req, res) => {
   try {
     const r = await db.query(
-      `SELECT id, name, kelas, display_id, current_level, card_shared,
+      `SELECT id, COALESCE(name, display_name) AS name, COALESCE(kelas, grade_level) AS kelas, display_id, current_level, card_shared,
               card_shared_at, parent_phone
        FROM students WHERE id = $1`,
       [req.user.id]
@@ -209,8 +228,8 @@ router.post('/parent/register', async (req, res) => {
     const hashed = await bcrypt.hash(password, 10);
 
     const r = await db.query(
-      `INSERT INTO parents (name, email, password_hash, phone)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO parents (name, display_name, email, password_hash, phone)
+       VALUES ($1::text, $1::text, $2, $3, $4)
        RETURNING id, name, email, phone`,
       [name.trim(), email.trim().toLowerCase(), hashed, phone_normalized]
     );
@@ -259,7 +278,7 @@ router.post('/parent/login', async (req, res) => {
       return res.status(400).json({ error: 'Email dan password wajib diisi.' });
 
     const r = await db.query(
-      'SELECT id, name, email, password_hash, phone FROM parents WHERE email = $1',
+      'SELECT id, COALESCE(name, display_name) AS name, email, password_hash, phone FROM parents WHERE email = $1',
       [email.trim().toLowerCase()]
     );
     const parent = r.rows[0];
@@ -289,7 +308,7 @@ router.post('/parent/add-child', requireAuth, requireParent, async (req, res) =>
     if (!did) return res.status(400).json({ error: 'Format ID tidak valid (contoh: B7KM).' });
 
     const sr = await db.query(
-      'SELECT id, name, kelas, display_id, current_level FROM students WHERE display_id = $1',
+      'SELECT id, COALESCE(name, display_name) AS name, COALESCE(kelas, grade_level) AS kelas, display_id, current_level FROM students WHERE display_id = $1',
       [did]
     );
     if (!sr.rows[0]) return res.status(404).json({ error: 'Siswa dengan ID tersebut tidak ditemukan.' });
@@ -305,6 +324,41 @@ router.post('/parent/add-child', requireAuth, requireParent, async (req, res) =>
 });
 
 // ── PARENT — Get children list ────────────────────────────────────────────────
+// ── PARENT — Merge account (D3, wajib) ───────────────────────────────────
+// Body: { source_email, password }. Pindahkan semua link anak dari akun
+// lama ke akun yg sedang login (dalam transaksi). Dipakai saat ortu tanpa
+// sengaja punya 2 akun (daftar via placement + daftar manual).
+router.post('/parent/merge-account', requireAuth, requireParent, async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    const { source_email, password } = req.body;
+    if (!source_email || !password)
+      return res.status(400).json({ error: 'source_email dan password wajib diisi.' });
+    const em = String(source_email).trim().toLowerCase();
+    const sr = await client.query('SELECT id, password_hash FROM parents WHERE email = $1', [em]);
+    if (!sr.rows[0]) return res.status(404).json({ error: 'Akun lama tidak ditemukan.' });
+    const srcId = sr.rows[0].id;
+    if (srcId === req.user.id)
+      return res.status(400).json({ error: 'Tidak bisa merge ke akun yang sama.' });
+    const valid = await bcrypt.compare(password, sr.rows[0].password_hash);
+    if (!valid) return res.status(401).json({ error: 'Password akun lama salah.' });
+    await client.query('BEGIN');
+    await client.query(
+      'INSERT INTO parent_children (parent_id, student_id) SELECT $1, student_id FROM parent_children WHERE parent_id = $2 ON CONFLICT DO NOTHING',
+      [req.user.id, srcId]
+    );
+    await client.query('DELETE FROM parent_children WHERE parent_id = $1', [srcId]);
+    await client.query('COMMIT');
+    const linked_children = await getLinkedChildren(req.user.id);
+    return res.json({ ok: true, linked_children });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.error('[auth/parent/merge-account]', err);
+    return res.status(500).json({ error: 'Server error.' });
+  } finally { client.release(); }
+});
+
+
 
 router.get('/parent/children', requireAuth, requireParent, async (req, res) => {
   try {
@@ -312,6 +366,92 @@ router.get('/parent/children', requireAuth, requireParent, async (req, res) => {
     return res.json({ children });
   } catch (err) {
     console.error('[auth/parent/children]', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// ── GET /api/auth/me — echo payload token ─────────────────────────────
+
+router.get('/me', requireAuth, async (req, res) => {
+  try {
+    return res.json({ auth: { id: req.auth.id, role: req.auth.role, sub: req.auth.id } });
+  } catch (err) {
+    console.error('[auth/me]', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// ── PARENT — Gate (D3, wajib) ────────────────────────────────────────────────
+// Endpoint challenge soal perkalian sebelum masuk area parent/guru dari sesi anak
+// Body: tidak ada
+// Response: { challenge_token, question }
+// Token: JWT Bearer (role parent) dengan expiry 2 menit (custom)
+// Validasi: hanya role parent/guru bisa akses
+
+router.get('/parent-gate/challenge', async (req, res) => {
+  try {
+    const { sub: parentId } = req.auth || {};
+
+    // Generate random multiplication question (2-9 × 2-9)
+    const a = Math.floor(Math.random() * 8) + 2; // 2-9
+    const b = Math.floor(Math.random() * 8) + 2; // 2-9
+    const correctAnswer = a * b;
+
+    // Create short-lived challenge token with answer
+    const challengeToken = jwt.sign({
+      role: 'parent_gate',
+      parent_id: parentId,
+      ans: correctAnswer
+    }, process.env.JWT_SECRET || 'cadas_app_secure_secret_key_2026', { expiresIn: '2m' });
+
+    const question = `${a} × ${b} = ?`;
+
+    return res.json({ challenge_token: challengeToken, question });
+  } catch (err) {
+    console.error('[auth/parent-gate/challenge]', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// Verifikasi jawaban challenge parent-gate
+// Body: { challenge_token, answer }
+// Response: { gate_token } pada jawaban benar
+// TTL gate_token: 15 menit
+
+router.post('/parent-gate/verify', async (req, res) => {
+  try {
+    const { challenge_token, answer } = req.body;
+    if (!challenge_token || typeof answer === 'undefined') {
+      return res.status(400).json({ error: 'challenge_token dan answer wajib diisi.' });
+    }
+
+    let decoded;
+    try {
+      decoded = jwt.verify(challenge_token, process.env.JWT_SECRET || 'cadas_app_secure_secret_key_2026');
+    } catch {
+      return res.status(401).json({ error: 'challenge_token tidak valid atau kedaluwarsa.' });
+    }
+
+    // Pastikan challenge token milik user yang sedang login dan role parent_gate
+    if (decoded.role !== 'parent_gate' || decoded.parent_id !== req.auth.sub) {
+      return res.status(403).json({ error: 'Akses ditolak untuk challenge token ini.' });
+    }
+
+    if (decoded.ans !== Number(answer)) {
+      return res.status(401).json({ error: 'Jawaban salah.' });
+    }
+
+    // Berikan gate_token untuk session parent selanjutnya
+    const gateToken = signToken({
+      role: 'parent',
+      sub: req.auth.sub,
+      kind: 'gate_pass',
+      challenge_valid: true
+    }, '15m');
+
+    return res.json({ gate_token: gateToken });
+  } catch (err) {
+    console.error('[auth/parent-gate/verify]', err);
     return res.status(500).json({ error: 'Server error.' });
   }
 });
