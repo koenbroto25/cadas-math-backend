@@ -29,3 +29,13 @@ upload_*.js
 railway_deploy_status.js
 *.lnk
 
+
+# Cline temp files
+_cl_*.txt
+_cl_*.cjs
+_cleanup_*.cjs
+
+# Cline temp files
+_cl_*.txt
+_cl_*.cjs
+_cleanup_*.cjs
