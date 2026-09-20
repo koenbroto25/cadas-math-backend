@@ -38,10 +38,14 @@ class GeminiTTSClient {
     }
 
     this.apiKeys = keys;
-    // Model TTS — gemini-3.1-flash-tts-preview (aktif, Sep 2026)
+    // Model TTS — bisa dioverride via GEMINI_TTS_MODEL; default preview (aktif Sep 2026).
+    // Rantai fallback model disiapkan di synthesize() karena Google bisa mem-rotasi
+    // model berlabel preview (HTTP 4xx/5xx mendadak) tanpa pengumuman shutdown
+    // — varian GA 'gemini-2.5-flash-tts' dipakai sebagai cadangan.
     this.model     = process.env.GEMINI_TTS_MODEL || 'gemini-3.1-flash-tts-preview';
     this.voiceName = process.env.GEMINI_TTS_VOICE || 'Kore';
     this._keyIndex = 0;
+    this._deadKeys = new Set(); // key yang ditolak 401/403 → dilewati rotasi
 
     console.log(`[GeminiTTS] ${this.apiKeys.length} key(s) loaded, model: ${this.model}`);
   }
@@ -49,10 +53,13 @@ class GeminiTTSClient {
   get available() { return this.apiKeys.length > 0; }
 
   _nextKey() {
-    if (this.apiKeys.length === 0) return null;
-    const key = this.apiKeys[this._keyIndex % this.apiKeys.length];
-    this._keyIndex++;
-    return key;
+    const n = this.apiKeys.length;
+    for (let i = 0; i < n; i++) {
+      const key = this.apiKeys[this._keyIndex % n];
+      this._keyIndex++;
+      if (!this._deadKeys.has(key)) return key;
+    }
+    return null; // semua key mati
   }
 
   /**
@@ -68,8 +75,20 @@ class GeminiTTSClient {
 
     const spokenText = normalizeSpeech(text);
 
+    // Patch 20 Sep 2026: batasi panjang teks TTS. Hasil ukur latensi:
+    // 200 ch ≈ 13s; teks 650+ ch > 25s (timeout). Jawaban untuk anak SD tidak
+    // perlu selengkap itu — potong di batas kalimat (default 400 karakter).
+    const MAX_TTS_CHARS = parseInt(process.env.GEMINI_TTS_MAX_CHARS || '400', 10);
+    let ttsInput = spokenText;
+    if (spokenText.length > MAX_TTS_CHARS) {
+      const cut = spokenText.slice(0, MAX_TTS_CHARS);
+      const lastStop = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('? '), cut.lastIndexOf('! '));
+      ttsInput = lastStop > 80 ? cut.slice(0, lastStop + 1) : cut;
+      console.log(`[GeminiTTS] teks dipotong ${spokenText.length} → ${ttsInput.length} karakter (batas ${MAX_TTS_CHARS})`);
+    }
+
     const body = {
-      contents: [{ parts: [{ text: spokenText }] }],
+      contents: [{ parts: [{ text: ttsInput }] }],
       generationConfig: {
         responseModalities: ['AUDIO'],
         speechConfig: {
@@ -82,45 +101,84 @@ class GeminiTTSClient {
       },
     };
 
-    const maxAttempts = parseInt(process.env.GEMINI_TTS_MAX_TRIES || '3', 10);
+    const maxAttempts = parseInt(process.env.GEMINI_TTS_MAX_TRIES || '5', 10);
 
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const key = this._nextKey();
-      const url = `${BASE_URL}/models/${this.model}:generateContent?key=${key}`;
-      try {
-        const response = await axios.post(url, body, {
-          timeout:      parseInt(process.env.GEMINI_TTS_TIMEOUT_MS || '120000', 10),
-          responseType: 'json',
-        });
+    // Rantai fallback model (patch 20 Sep 2026, diperkaya masukan user):
+    // kuota gratis Gemini per-model INDEPENDEN — jika 1 model habis kuota (429),
+    // pindah ke model berikutnya = kuota baru. Urutan:
+    //  utama (env/kode) → flash GA → flash-lite preview → pro.
+    // Bisa dioverride via GEMINI_TTS_MODELS (koma-separated).
+    const envModels = (process.env.GEMINI_TTS_MODELS || '')
+      .split(',').map(s => s.trim()).filter(Boolean);
+    const modelChain = [];
+    for (const m of [
+      ...envModels,
+      this.model,
+      'gemini-2.5-flash-tts',
+      'gemini-2.5-flash-lite-preview-tts',
+      'gemini-2.5-pro-tts',
+    ]) {
+      if (m && !modelChain.includes(m)) modelChain.push(m);
+    }
 
-        const candidate = response.data.candidates?.[0];
-        const part      = candidate?.content?.parts?.find(p => p.inlineData);
-        if (!part?.inlineData?.data) {
-          throw new Error('No audio data in Gemini response');
-        }
+    let lastErr = null;
+    for (const model of modelChain) {
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        const key = this._nextKey();
+        if (!key) break; // semua key mati
+        const url = `${BASE_URL}/models/${model}:generateContent?key=${key}`;
+        try {
+          const response = await axios.post(url, body, {
+            timeout:      parseInt(process.env.GEMINI_TTS_TIMEOUT_MS || '120000', 10),
+            responseType: 'json',
+          });
 
-        const audioBuffer = Buffer.from(part.inlineData.data, 'base64');
-        const mimeType    = part.inlineData.mimeType || 'audio/pcm';
-        return {
-          audioBuffer,
-          mimeType,
-          sampleRate: GeminiTTSClient.parseSampleRate(mimeType) || 24000,
-        };
+          const candidate = response.data.candidates?.[0];
+          const part      = candidate?.content?.parts?.find(p => p.inlineData);
+          if (!part?.inlineData?.data) {
+            throw Object.assign(new Error('No audio data in Gemini response'), { response: { status: 502 } });
+          }
 
-      } catch (error) {
-        const status = error.response?.status;
-        const detail = error.response?.data?.error?.message || error.message;
-        if (status === 429 && attempt < maxAttempts - 1) {
-          const m    = /retry in ([\d.]+)s/i.exec(detail);
-          const wait = m ? parseFloat(m[1]) : 30;
-          console.warn(`[GeminiTTS] 429 quota → retry in ${wait.toFixed(0)}s (attempt ${attempt + 2}/${maxAttempts})`);
-          await new Promise(r => setTimeout(r, wait * 1000 + 800));
+          const audioBuffer = Buffer.from(part.inlineData.data, 'base64');
+          const mimeType    = part.inlineData.mimeType || 'audio/pcm';
+          return {
+            audioBuffer,
+            mimeType,
+            sampleRate: GeminiTTSClient.parseSampleRate(mimeType) || 24000,
+          };
+
+        } catch (error) {
+          const status = error.response?.status;
+          const detail = error.response?.data?.error?.message || error.message;
+          lastErr = new Error(`Gemini TTS error (${model}) (${status}): ${detail}`);
+
+          if (/timeout/i.test(error.message || '') || error.code === 'ECONNABORTED') {
+            console.warn(`[GeminiTTS] timeout → rotasi key/model (model ${model}, attempt ${attempt + 2}/${maxAttempts})`);
+            continue;
+          }
+
+          if (status === 429 && attempt < maxAttempts - 1) {
+            // Kuota model ini habis untuk key ini → pindah MODEL berikutnya
+            // (kuota gratis per-model independen), bukan hanya ganti key.
+            console.warn(`[GeminiTTS] 429 kuota habis (model ${model}) → pindah model berikutnya`);
+            break;
+          }
+          if (status === 401 || status === 403) {
+            this._deadKeys.add(key);
+            console.warn(`[GeminiTTS] key ditolak (${status}) → tandai mati & rotasi (total mati: ${this._deadKeys.size}/${this.apiKeys.length})`);
+            continue;
+          }
+          if (status === 404 || /not found|not supported|does not exist/i.test(detail || '')) {
+            console.warn(`[GeminiTTS] model ${model} tidak tersedia (${detail}) → fallback ke model berikutnya`);
+            break; // keluar loop attempt → model berikutnya
+          }
+          // 5xx / 400 lain: coba key berikutnya (bisa key/konteks spesifik)
+          console.warn(`[GeminiTTS] error ${status} → coba key berikutnya (model ${model}, attempt ${attempt + 2}/${maxAttempts}): ${detail}`);
           continue;
         }
-        throw new Error(`Gemini TTS error (${status}): ${detail}`);
       }
     }
-    throw new Error('Gemini TTS error: all attempts exhausted');
+    throw lastErr || new Error('Gemini TTS error: all attempts exhausted');
   }
 
   /**
