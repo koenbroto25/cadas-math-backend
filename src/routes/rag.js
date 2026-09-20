@@ -23,6 +23,7 @@ const { getLevelAccess } = require('../middleware/level-access');
  * Body: { student_id, question_text, concept_id?, level }
  */
 router.post('/ask', async (req, res) => {
+  const tReq = Date.now();
   try {
     const { student_id, question_text, concept_id, level } = req.body;
 
@@ -30,8 +31,20 @@ router.post('/ask', async (req, res) => {
       return res.status(400).json({ error: 'student_id, question_text, and level are required' });
     }
 
+    // Guard P0-A: students.id bertipe UUID — tolak format non-UUID dengan 400
+    // agar tidak jadi 500 DatabaseError di getLevelAccess (backtest 19 Sep 2026).
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!UUID_RE.test(String(student_id))) {
+      console.warn(`[RAG][ask] invalid student_id format="${String(student_id).slice(0, 40)}" ms=${Date.now() - tReq}`);
+      return res.status(400).json({
+        error: 'INVALID_STUDENT_ID',
+        message: 'student_id harus UUID siswa yang valid.',
+      });
+    }
+
     const access = await getLevelAccess(db, student_id, level);
     if (access === 'locked') {
+      console.warn(`[RAG][ask] stage=access result=locked student=${String(student_id).slice(0, 8)} level=${level} ms=${Date.now() - tReq}`);
       return res.status(403).json({
         error: 'PREMIUM_REQUIRED',
         message: `Level ${level} belum dibeli. Upgrade untuk mengakses fitur ini.`,
@@ -47,9 +60,18 @@ router.post('/ask', async (req, res) => {
       accessType: access,
     });
 
+    console.log(`[RAG][ask] stage=done student=${String(student_id).slice(0, 8)} level=${level} access=${access} source=${result.source} cached=${result.cached} ms=${Date.now() - tReq}`);
     res.json(result);
   } catch (error) {
-    console.error('RAG ask error:', error);
+    // Log detail: bedakan sumber throw (DB/LLM/TTS/validator) + stack ringkas.
+    const src = /uuid|pg_|pool|Neon|connection|timeout.*db|database/i.test(error.message || '')
+      ? 'DB'
+      : /OpenRouter|Gemini|TTS|429|402|401/i.test(error.message || '')
+        ? 'LLM/TTS'
+        : /length|undefined|null|Type/i.test(error.message || '')
+          ? 'CODE'
+          : 'UNKNOWN';
+    console.error(`[RAG][ask] stage=THROW src=${src} err=${error.constructor.name}: ${(error.message || '').slice(0, 200)} ms=${Date.now() - tReq}\n  stack: ${(error.stack || '').split('\n').slice(0, 4).join(' <- ').slice(0, 400)}`);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
