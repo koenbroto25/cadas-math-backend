@@ -20,6 +20,7 @@ const crypto     = require('crypto');
 const http       = require('http');
 const db         = require('../database/db');
 const normalizer = require('./normalizer');
+const { OP_SYNONYMS } = require('./id-math-synonyms');
 const openrouter = require('./openrouter-client');
 const geminiTTS  = require('./gemini-tts');
 const {
@@ -110,15 +111,55 @@ async function lexicalSearch(question, level, conceptId) {
     }
   }
 
+  // ── P2-A patch (20 Sep 2026) ──────────────────────────────────────────
+  // Dulu: fuzzy pakai ILIKE KALIMAT PENUH → kandidat selalu kosong untuk
+  // pertanyaan natural (backtest 20 Sep: "berapa 1 tambah 2" level 1 → none).
+  // Sekarang: kandidat diambil via ILIKE OR per-kata-signifikan (plus kanon
+  // operator dari OP_SYNONYMS), lalu dinilai word-ratio (threshold 0.6 tetap).
+  const tokens = normalizedQ
+    .replace(/\[[^\]]*\]/g, ' ')      // buang tag bracket (dedupe/backtest)
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+
+  const STOPWORDS = new Set([
+    'yang', 'dan', 'atau', 'adalah', 'itu', 'ini', 'untuk', 'dengan', 'pada',
+    'berapa', 'apakah', 'siapa', 'kenapa', 'gimana', 'bagaimana', 'tolong',
+    'mohon', 'bantu', 'jelaskan', 'jelasin', 'cara', 'contoh', 'soal', 'buat',
+    'buatkan', 'tentang', 'jawab', 'jawaban', 'hitung', 'hitungkan', 'ya',
+    'dong', 'deh', 'kak', 'kakak', 'saya', 'aku', 'kamu', 'kita', 'anak',
+    'sd', 'kelas', 'nomor', 'nomer', 'sebutkan', 'tuliskan', 'tulis',
+    'operasi', 'coba', 'maksud', 'artinya', 'apabila', 'bisa', 'mau',
+  ]);
+  const OP_CANON = { '+': 'tambah', '-': 'kurang', '*': 'kali', '/': 'bagi', 'frac': 'pecahan', 'pct': 'persen' };
+
+  const distinctive = [];
+  const patterns = [];
+  const seenTok = new Set();
+  for (const t of tokens) {
+    if (t.length < 3 || /^\d+$/.test(t) || STOPWORDS.has(t) || seenTok.has(t)) continue;
+    seenTok.add(t);
+    distinctive.push(t);
+    patterns.push(`%${t}%`);
+    const op = OP_SYNONYMS[t];
+    if (op && OP_CANON[op] && !seenTok.has(OP_CANON[op])) {
+      seenTok.add(OP_CANON[op]);
+      patterns.push(`%${OP_CANON[op]}%`);
+    }
+  }
+
+  if (distinctive.length === 0) {
+    return { hit: 'weak', source: 'lexical', results: [] };
+  }
+
   const fuzzy = await db.query(
     `SELECT id, concept_id, level_id, content, audio_url, viseme_json, variants
      FROM explanations
-     WHERE level_id = $1 AND (content ILIKE $2 OR variants::text ILIKE $2)
-     ORDER BY created_at DESC LIMIT 20`,
-    [level, `%${normalizedQ}%`]
+     WHERE level_id = $1 AND (content ILIKE ANY($2::text[]) OR variants::text ILIKE ANY($2::text[]))
+     ORDER BY created_at DESC LIMIT 30`,
+    [level, patterns]
   );
 
-  const words = normalizedQ.split(/\s+/).filter(w => w.length >= 3);
+  const canonOf = (w) => { const o = OP_SYNONYMS[w]; return o && OP_CANON[o]; };
   let best = null, bestRatio = 0, bestText = null;
 
   for (const row of fuzzy.rows) {
@@ -133,8 +174,8 @@ async function lexicalSearch(question, level, conceptId) {
     }
     for (const c of candidates) {
       const lower   = c.text.toLowerCase();
-      const matched = words.filter(w => lower.includes(w)).length;
-      const ratio   = words.length > 0 ? matched / words.length : 0;
+      const matched = distinctive.filter(w => lower.includes(w) || (canonOf(w) && lower.includes(canonOf(w)))).length;
+      const ratio   = distinctive.length > 0 ? matched / distinctive.length : 0;
       if (ratio > bestRatio) { bestRatio = ratio; best = row; bestText = c.text; }
     }
   }
