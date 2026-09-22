@@ -3,9 +3,10 @@
  *
  * F-1: Reminder malam jam 20:00 WIB setiap hari
  * F-2: Cek jadwal terlewat - jalan setiap 15 menit
+ * F-5: Notif weekly summary - Minggu malam jam 20:00 WIB
  */
 const cron = require('node-cron');
-const { sendNightReminders, sendMissedScheduleNotifs } = require('./notify');
+const { sendNightReminders, sendMissedScheduleNotifs, sendWeeklySummaryNotifs } = require('./notify');
 
 function initCron() {
   // F-1: Jam 20:00 WIB setiap hari (UTC+7 = 13:00 UTC)
@@ -18,7 +19,7 @@ function initCron() {
     }
   }, { timezone: 'UTC' });
 
-  // F-2: Setiap 15 menit - cek jadwal yang end_time sudah lewat 15 menit
+  // F-2: Setiap 15 menit - cek jadwal yang end_time sudah lewat
   cron.schedule('*/15 * * * *', async () => {
     try {
       await sendMissedScheduleNotifs();
@@ -27,7 +28,17 @@ function initCron() {
     }
   }, { timezone: 'UTC' });
 
-  console.log('[cron] Cron jobs aktif: night reminder (20:00 WIB) + missed schedule (setiap 15 menit)');
+  // F-5: Minggu malam jam 20:00 WIB (UTC = 13:00, DOW = 0 = Minggu)
+  cron.schedule('0 13 * * 0', async () => {
+    console.log('[cron] Weekly summary dimulai...');
+    try {
+      await sendWeeklySummaryNotifs();
+    } catch (err) {
+      console.error('[cron] Weekly summary error:', err.message);
+    }
+  }, { timezone: 'UTC' });
+
+  console.log('[cron] Cron jobs aktif: night reminder + missed schedule + weekly summary');
 }
 
 module.exports = { initCron };

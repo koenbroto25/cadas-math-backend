@@ -261,9 +261,66 @@ async function sendMissedScheduleNotifs() {
   console.log('[notify] Missed schedule check selesai');
 }
 
+
+/**
+ * F-5: Notif ringkasan mingguan (dipanggil dari cron Minggu malam)
+ */
+async function sendWeeklySummaryNotifs() {
+  // Ambil semua siswa yang punya parent token
+  const r = await db.query(`
+    SELECT DISTINCT
+      s.id            AS student_id,
+      COALESCE(s.name, s.display_name, s.display_id) AS nama,
+      s.weekly_target_days
+    FROM students s
+    JOIN parent_children pc ON pc.student_id = s.id
+    JOIN device_tokens dt   ON dt.user_id = pc.parent_id AND dt.user_type = 'parent'
+  `);
+
+  for (const row of r.rows) {
+    const stats = await db.query(`
+      SELECT
+        COUNT(DISTINCT DATE(started_at AT TIME ZONE 'Asia/Jakarta'))::int AS hari_belajar,
+        ROUND(AVG(duration_active_ms) / 60000.0, 1)                       AS rata_durasi_menit,
+        ROUND(AVG(accuracy), 1)                                            AS rata_akurasi,
+        ROUND(AVG(focus_ratio), 1)                                         AS rata_fokus
+      FROM study_sessions
+      WHERE student_id = $1
+        AND status = 'completed'
+        AND started_at >= NOW() - INTERVAL '7 days'
+    `, [row.student_id]);
+
+    const s = stats.rows[0];
+    const hariBelajar  = s.hari_belajar  || 0;
+    const targetHari   = row.weekly_target_days || 5;
+    const rataDurasi   = s.rata_durasi_menit || 0;
+    const rataAkurasi  = s.rata_akurasi  || 0;
+    const rataFokus    = s.rata_fokus    || 0;
+
+    // Skip jika tidak ada aktivitas sama sekali minggu ini
+    if (hariBelajar === 0) continue;
+
+    const tokens = await getParentTokens(row.student_id);
+    if (tokens.length === 0) continue;
+
+    const tercapai = hariBelajar >= targetHari;
+    const emoji    = tercapai ? 'Luar biasa!' : 'Terus semangat!';
+
+    const body = `${emoji} Minggu ini ${row.nama} belajar ${hariBelajar}/${targetHari} hari, ` +
+      `rata-rata ${rataDurasi} menit/sesi, akurasi ${rataAkurasi}%, fokus ${rataFokus}%.`;
+
+    await sendFcm(tokens, 'Laporan Mingguan', body, {
+      type:       'weekly_summary',
+      student_id: String(row.student_id),
+    }).catch((e) => console.error('[notify/weekly]', row.student_id, e.message));
+  }
+  console.log('[notify] Weekly summary selesai, diproses', r.rows.length, 'siswa');
+}
+
 module.exports = {
   sendSessionResultNotif,
   sendDistractionNotif,
   sendNightReminders,
   sendMissedScheduleNotifs,
+  sendWeeklySummaryNotifs,
 };
