@@ -1,16 +1,45 @@
-﻿/**
- * utils/notify.js - FCM Push Notification Helper
- * Kirim notifikasi ke device token parent yang terhubung ke student.
+/**
+ * utils/notify.js - FCM Push Notification Helper (FCM HTTP v1)
+ *
+ * Memakai Google Auth Library + Service Account JSON untuk OAuth2 token.
+ * Legacy FCM API sudah deprecated sejak Juni 2024 -- wajib pakai v1.
  *
  * Env yang dibutuhkan:
- *   FCM_SERVER_KEY = key dari Firebase Console -> Project Settings -> Cloud Messaging
+ *   FCM_SERVICE_ACCOUNT_PATH = path absolut ke service account JSON
  *
- * Jika FCM_SERVER_KEY belum diset, fungsi log warning dan return tanpa error
- * sehingga flow sesi tidak terganggu.
+ * Jika FCM_SERVICE_ACCOUNT_PATH belum diset, fungsi log warning dan
+ * return tanpa error sehingga flow sesi tidak terganggu.
  */
 const db = require('../database/db');
 
-const FCM_URL = 'https://fcm.googleapis.com/fcm/send';
+const FCM_SCOPE = 'https://www.googleapis.com/auth/firebase.messaging';
+let _projectId = null;
+
+/**
+ * Ambil OAuth2 access token dari service account JSON
+ */
+async function getAccessToken() {
+  const path = process.env.FCM_SERVICE_ACCOUNT_PATH;
+  if (!path) {
+    console.warn('[notify] FCM_SERVICE_ACCOUNT_PATH belum diset');
+    return null;
+  }
+  const { GoogleAuth } = require('google-auth-library');
+  const auth = new GoogleAuth({
+    keyFile: path,
+    scopes: [FCM_SCOPE],
+  });
+  const client = await auth.getClient();
+  const token  = await client.getAccessToken();
+
+  // Ambil project_id dari service account JSON (sekali saja)
+  if (!_projectId) {
+    const sa = require(path);
+    _projectId = sa.project_id;
+  }
+
+  return token.token || token;
+}
 
 /**
  * Ambil semua FCM token parent yang terhubung ke student_id
@@ -38,46 +67,64 @@ async function getStudentName(studentId) {
 }
 
 /**
- * Kirim FCM ke satu atau banyak token
+ * Kirim FCM v1 ke satu token
  */
-async function sendFcm(tokens, title, body, data = {}) {
-  const key = process.env.FCM_SERVER_KEY;
-  if (!key) {
-    console.warn('[notify] FCM_SERVER_KEY belum diset — notif dilewati');
-    return;
-  }
-  if (!tokens || tokens.length === 0) return;
-
-  const registrationIds = tokens.map((t) => t.token);
-
+async function sendOneFcm(accessToken, projectId, deviceToken, title, body, data = {}) {
+  const url = `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`;
   const payload = {
-    registration_ids: registrationIds,
-    notification: { title, body, sound: 'default' },
-    data,
-    priority: 'high',
+    message: {
+      token: deviceToken,
+      notification: { title, body },
+      data: Object.fromEntries(
+        Object.entries(data).map(([k, v]) => [k, String(v)])
+      ),
+      android: { priority: 'high' },
+      apns: {
+        payload: { aps: { sound: 'default' } },
+      },
+    },
   };
 
-  const res = await fetch(FCM_URL, {
+  const res = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `key=${key}`,
+      'Authorization': `Bearer ${accessToken}`,
     },
     body: JSON.stringify(payload),
   });
 
   if (!res.ok) {
     const txt = await res.text();
-    console.error('[notify] FCM error:', res.status, txt);
+    // Token tidak valid / expired: log tapi jangan throw
+    if (res.status === 404 || res.status === 400) {
+      console.warn('[notify] Token tidak valid, skip:', deviceToken.slice(0, 20), txt.slice(0, 100));
+      return;
+    }
+    console.error('[notify] FCM v1 error:', res.status, txt.slice(0, 200));
+  }
+}
+
+/**
+ * Kirim FCM ke semua token (satu per satu — FCM v1 tidak support batch sederhana)
+ */
+async function sendFcm(tokens, title, body, data = {}) {
+  if (!tokens || tokens.length === 0) return;
+
+  const accessToken = await getAccessToken();
+  if (!accessToken) return;
+  if (!_projectId) {
+    console.warn('[notify] project_id tidak ditemukan');
     return;
   }
 
-  const json = await res.json();
-  if (json.failure > 0) {
-    console.warn('[notify] FCM partial failure:', json.failure, 'dari', registrationIds.length);
-  } else {
-    console.log('[notify] FCM ok, dikirim ke', registrationIds.length, 'token');
-  }
+  const results = await Promise.allSettled(
+    tokens.map((t) => sendOneFcm(accessToken, _projectId, t.token, title, body, data))
+  );
+
+  const ok      = results.filter((r) => r.status === 'fulfilled').length;
+  const failed  = results.filter((r) => r.status === 'rejected').length;
+  console.log(`[notify] FCM selesai: ${ok} ok, ${failed} gagal dari ${tokens.length} token`);
 }
 
 /**
@@ -96,8 +143,7 @@ async function sendSessionResultNotif(studentId, session) {
   const naik      = session.level_up;
 
   let body = `${nama} baru selesai belajar! Akurasi ${akurasi}%, ${totalSoal} soal, ${durMenit} menit.`;
-  if (naik) body += ' Naik level! Keren! 🚀';
-  else body += ' 🎉';
+  if (naik) body += ' Naik level! Keren!';
 
   await sendFcm(tokens, 'Sesi Belajar Selesai', body, {
     type:       'session_result',
@@ -132,11 +178,9 @@ async function sendDistractionNotif(studentId, session) {
 }
 
 /**
- * F-1: Notif reminder malam (dipanggil dari cron)
- * Cek semua siswa yang belum capai target harian, kirim ke parent.
+ * F-1: Notif reminder malam (dipanggil dari cron jam 20:00 WIB)
  */
 async function sendNightReminders() {
-  // Ambil semua siswa dengan parent token, cek akumulasi hari ini (WIB = UTC+7)
   const r = await db.query(`
     SELECT
       s.id            AS student_id,
@@ -174,10 +218,9 @@ async function sendNightReminders() {
 }
 
 /**
- * F-2: Notif jadwal terlewat (dipanggil dari cron, 15 menit setelah end_time)
+ * F-2: Notif jadwal terlewat (dipanggil dari cron setiap 15 menit)
  */
 async function sendMissedScheduleNotifs() {
-  // Ambil semua jadwal aktif hari ini (hari dalam timezone masing-masing)
   const r = await db.query(`
     SELECT
       sch.student_id,
@@ -192,7 +235,6 @@ async function sendMissedScheduleNotifs() {
   `);
 
   for (const row of r.rows) {
-    // Cek apakah ada sesi dalam window jadwal hari ini
     const check = await db.query(`
       SELECT 1 FROM study_sessions
       WHERE student_id = $1
@@ -202,7 +244,7 @@ async function sendMissedScheduleNotifs() {
       LIMIT 1
     `, [row.student_id, row.timezone, row.start_time, row.end_time]);
 
-    if (check.rowCount > 0) continue; // sudah belajar dalam jadwal
+    if (check.rowCount > 0) continue;
 
     const tokens = await getParentTokens(row.student_id);
     if (tokens.length === 0) continue;
