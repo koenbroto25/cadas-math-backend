@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
 const db = require('./database/db');
+const { initCron } = require('./utils/cron');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -33,11 +34,14 @@ app.use('/api/admin',        require('./routes/admin'));       // Sprint D.4 - a
 app.use('/api/referrer',     require('./routes/referrer'));    // Sprint D.3+D.5 - referrer auth+dashboard
 app.use('/api/teacher',      require('./routes/teacher'));     // Sprint F
 app.use('/api/parent',       require('./routes/parent'));      // Sprint E
+app.use('/api/session',      require('./routes/session'));     // Sprint S-2 session tracking
+app.use('/api/schedule',     require('./routes/schedule'));    // Sprint S-3 jadwal belajar
+app.use('/api/device-token', require('./routes/schedule'));    // Sprint S-1 FCM token (via schedule.js)
 app.use('/api/midtrans',    require('./routes/midtrans'));   // Sprint D.2 - midtrans gateway
 
 // Sprint F.5 - /api/config: konfigurasi dinamis untuk mobile (public, tanpa auth)
 // Aplikasi fetch endpoint ini saat startup, simpan ke store/AsyncStorage.
-// Update nilai di sini (atau .env backend) Ã¢â€ â€™ restart backend Ã¢â€ â€™ app ikut berubah TANPA rebuild APK.
+// Update nilai di sini (atau .env backend) → restart backend → app ikut berubah TANPA rebuild APK.
 app.get('/api/config', (req, res) => {
   res.json({
     apiVersion:  '1.0.0',
@@ -45,7 +49,7 @@ app.get('/api/config', (req, res) => {
     pwaUrl:      process.env.PWA_URL      || 'https://cadasmatematika.id',
     r2PublicUrl: process.env.R2_PUBLIC_URL || null,
     adminWhatsapp: process.env.ADMIN_WHATSAPP || null,
-    // Flag kontrol fitur Ã¢â‚¬â€ tambahkan sesuai kebutuhan:
+    // Flag kontrol fitur — tambahkan sesuai kebutuhan:
     // maintenanceMode, minSupportedVersion, ttsEnabled, dsb.
   });
 });
@@ -209,11 +213,14 @@ const { setEnrichedOps }        = require('./rag/math-validator');
     initSoalCerita(enriched.opSynonyms, null);   // Layer B deteksi operasi soal cerita
     setEnrichedOps(enriched.opSynonyms);         // Layer B koreksi math-validator
     initQueryProcessor(enriched);                // enriched synonyms query-processor
-    console.log('[Startup] Ã¢Å“â€¦ Enriched vocab siap:', enriched.stats);
+    console.log('[Startup] ✅ Enriched vocab siap:', enriched.stats);
   } catch (err) {
-    console.warn('[Startup] Ã¢Å¡Â Ã¯Â¸Â Vocab enrichment gagal Ã¢â‚¬â€ pakai base hardcode:', err.message);
+    console.warn('[Startup] ⚠️ Vocab enrichment gagal — pakai base hardcode:', err.message);
   }
 })();
+
+// Init cron jobs (session notification system)
+initCron();
 
 app.listen(PORT, process.env.HOST || '0.0.0.0', () => {
   console.log(`Cadas backend running on port ${PORT}`);

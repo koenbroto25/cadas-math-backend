@@ -1,4 +1,4 @@
-/**
+﻿/**
  * routes/parent.js - Sprint E
  * Parent Dashboard Routes (dilindungi JWT role parent)
  *
@@ -175,6 +175,251 @@ router.get('/child/:student_id/billing', async (req, res) => {
       student:         s.rows[0],
       payment_records: payments.rows,
       midtrans_invoices: midtrans.rows,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
+// GET /api/parent/child/:student_id/study-sessions?page=1&limit=20
+// Riwayat study_sessions (tabel baru dengan focus_ratio, exit_count, dll)
+router.get('/child/:student_id/study-sessions', async (req, res) => {
+  try {
+    if (!await ownedByParent(req.auth.id, req.params.student_id)) {
+      return res.status(403).json({ error: 'akses ditolak' });
+    }
+    const page   = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit  = Math.min(50, parseInt(req.query.limit) || 20);
+    const offset = (page - 1) * limit;
+
+    const sessions = await db.query(`
+      SELECT
+        id, level, correct_count, total_count, accuracy,
+        ROUND(duration_active_ms / 60000.0, 1) AS durasi_aktif_menit,
+        focus_ratio, exit_count, level_up, status, started_at, ended_at
+      FROM study_sessions
+      WHERE student_id = $1 AND status = 'completed'
+      ORDER BY started_at DESC
+      LIMIT $2 OFFSET $3
+    `, [req.params.student_id, limit, offset]);
+
+    const total = await db.query(
+      "SELECT COUNT(*)::int AS cnt FROM study_sessions WHERE student_id = $1 AND status = 'completed'",
+      [req.params.student_id]
+    );
+
+    res.json({ page, limit, total: total.rows[0].cnt, sessions: sessions.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/parent/weekly-summary/:student_id
+// Ringkasan mingguan: hari belajar, rata-rata durasi, akurasi, trend fokus
+router.get('/weekly-summary/:student_id', async (req, res) => {
+  try {
+    if (!await ownedByParent(req.auth.id, req.params.student_id)) {
+      return res.status(403).json({ error: 'akses ditolak' });
+    }
+
+    const r = await db.query(`
+      SELECT
+        COUNT(DISTINCT DATE(started_at AT TIME ZONE 'Asia/Jakarta'))::int AS hari_belajar,
+        COUNT(*)::int                                                       AS total_sesi,
+        ROUND(AVG(duration_active_ms) / 60000.0, 1)                        AS rata_durasi_menit,
+        ROUND(AVG(accuracy), 1)                                             AS rata_akurasi,
+        ROUND(AVG(focus_ratio), 1)                                          AS rata_fokus_ratio,
+        SUM(correct_count)::int                                             AS total_benar,
+        SUM(total_count)::int                                               AS total_soal
+      FROM study_sessions
+      WHERE student_id = $1
+        AND status = 'completed'
+        AND started_at >= NOW() - INTERVAL '7 days'
+    `, [req.params.student_id]);
+
+    const daily = await db.query(`
+      SELECT
+        DATE(started_at AT TIME ZONE 'Asia/Jakarta') AS tanggal,
+        ROUND(SUM(duration_active_ms) / 60000.0, 1) AS durasi_menit,
+        ROUND(AVG(accuracy), 1)                      AS akurasi,
+        ROUND(AVG(focus_ratio), 1)                   AS fokus_ratio,
+        COUNT(*)::int                                AS jumlah_sesi
+      FROM study_sessions
+      WHERE student_id = $1
+        AND status = 'completed'
+        AND started_at >= NOW() - INTERVAL '7 days'
+      GROUP BY DATE(started_at AT TIME ZONE 'Asia/Jakarta')
+      ORDER BY tanggal
+    `, [req.params.student_id]);
+
+    const s = await db.query(
+      "SELECT daily_target_minutes, weekly_target_days FROM students WHERE id = $1",
+      [req.params.student_id]
+    );
+
+    res.json({
+      summary:       r.rows[0],
+      daily_detail:  daily.rows,
+      targets:       s.rows[0] || { daily_target_minutes: 30, weekly_target_days: 5 },
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/parent/child/:student_id/study-sessions?page=1&limit=20
+// Riwayat study_sessions (tabel baru dengan focus_ratio, exit_count, dll)
+router.get('/child/:student_id/study-sessions', async (req, res) => {
+  try {
+    if (!await ownedByParent(req.auth.id, req.params.student_id)) {
+      return res.status(403).json({ error: 'akses ditolak' });
+    }
+    const page   = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit  = Math.min(50, parseInt(req.query.limit) || 20);
+    const offset = (page - 1) * limit;
+
+    const sessions = await db.query(`
+      SELECT
+        id, level, correct_count, total_count, accuracy,
+        ROUND(duration_active_ms / 60000.0, 1) AS durasi_aktif_menit,
+        focus_ratio, exit_count, level_up, status, started_at, ended_at
+      FROM study_sessions
+      WHERE student_id = $1 AND status = 'completed'
+      ORDER BY started_at DESC
+      LIMIT $2 OFFSET $3
+    `, [req.params.student_id, limit, offset]);
+
+    const total = await db.query(
+      "SELECT COUNT(*)::int AS cnt FROM study_sessions WHERE student_id = $1 AND status = 'completed'",
+      [req.params.student_id]
+    );
+
+    res.json({ page, limit, total: total.rows[0].cnt, sessions: sessions.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/parent/weekly-summary/:student_id
+// Ringkasan mingguan: hari belajar, rata-rata durasi, akurasi, trend fokus
+router.get('/weekly-summary/:student_id', async (req, res) => {
+  try {
+    if (!await ownedByParent(req.auth.id, req.params.student_id)) {
+      return res.status(403).json({ error: 'akses ditolak' });
+    }
+
+    const r = await db.query(`
+      SELECT
+        COUNT(DISTINCT DATE(started_at AT TIME ZONE 'Asia/Jakarta'))::int AS hari_belajar,
+        COUNT(*)::int                                                       AS total_sesi,
+        ROUND(AVG(duration_active_ms) / 60000.0, 1)                        AS rata_durasi_menit,
+        ROUND(AVG(accuracy), 1)                                             AS rata_akurasi,
+        ROUND(AVG(focus_ratio), 1)                                          AS rata_fokus_ratio,
+        SUM(correct_count)::int                                             AS total_benar,
+        SUM(total_count)::int                                               AS total_soal
+      FROM study_sessions
+      WHERE student_id = $1
+        AND status = 'completed'
+        AND started_at >= NOW() - INTERVAL '7 days'
+    `, [req.params.student_id]);
+
+    const daily = await db.query(`
+      SELECT
+        DATE(started_at AT TIME ZONE 'Asia/Jakarta') AS tanggal,
+        ROUND(SUM(duration_active_ms) / 60000.0, 1) AS durasi_menit,
+        ROUND(AVG(accuracy), 1)                      AS akurasi,
+        ROUND(AVG(focus_ratio), 1)                   AS fokus_ratio,
+        COUNT(*)::int                                AS jumlah_sesi
+      FROM study_sessions
+      WHERE student_id = $1
+        AND status = 'completed'
+        AND started_at >= NOW() - INTERVAL '7 days'
+      GROUP BY DATE(started_at AT TIME ZONE 'Asia/Jakarta')
+      ORDER BY tanggal
+    `, [req.params.student_id]);
+
+    const s = await db.query(
+      "SELECT daily_target_minutes, weekly_target_days FROM students WHERE id = $1",
+      [req.params.student_id]
+    );
+
+    res.json({
+      summary:       r.rows[0],
+      daily_detail:  daily.rows,
+      targets:       s.rows[0] || { daily_target_minutes: 30, weekly_target_days: 5 },
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/parent/child/:student_id/study-sessions?page=1&limit=20
+router.get('/child/:student_id/study-sessions', async (req, res) => {
+  try {
+    if (!await ownedByParent(req.auth.id, req.params.student_id)) {
+      return res.status(403).json({ error: 'akses ditolak' });
+    }
+    const page   = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit  = Math.min(50, parseInt(req.query.limit) || 20);
+    const offset = (page - 1) * limit;
+
+    const sessions = await db.query(`
+      SELECT
+        id, level, correct_count, total_count, accuracy,
+        ROUND(duration_active_ms / 60000.0, 1) AS durasi_aktif_menit,
+        focus_ratio, exit_count, level_up, status, started_at, ended_at
+      FROM study_sessions
+      WHERE student_id = $1 AND status = 'completed'
+      ORDER BY started_at DESC
+      LIMIT $2 OFFSET $3
+    `, [req.params.student_id, limit, offset]);
+
+    const total = await db.query(
+      "SELECT COUNT(*)::int AS cnt FROM study_sessions WHERE student_id = $1 AND status = 'completed'",
+      [req.params.student_id]
+    );
+
+    res.json({ page, limit, total: total.rows[0].cnt, sessions: sessions.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/parent/weekly-summary/:student_id
+router.get('/weekly-summary/:student_id', async (req, res) => {
+  try {
+    if (!await ownedByParent(req.auth.id, req.params.student_id)) {
+      return res.status(403).json({ error: 'akses ditolak' });
+    }
+
+    const r = await db.query(`
+      SELECT
+        COUNT(DISTINCT DATE(started_at AT TIME ZONE 'Asia/Jakarta'))::int AS hari_belajar,
+        COUNT(*)::int                                                       AS total_sesi,
+        ROUND(AVG(duration_active_ms) / 60000.0, 1)                        AS rata_durasi_menit,
+        ROUND(AVG(accuracy), 1)                                             AS rata_akurasi,
+        ROUND(AVG(focus_ratio), 1)                                          AS rata_fokus_ratio,
+        SUM(correct_count)::int                                             AS total_benar,
+        SUM(total_count)::int                                               AS total_soal
+      FROM study_sessions
+      WHERE student_id = $1
+        AND status = 'completed'
+        AND started_at >= NOW() - INTERVAL '7 days'
+    `, [req.params.student_id]);
+
+    const daily = await db.query(`
+      SELECT
+        DATE(started_at AT TIME ZONE 'Asia/Jakarta') AS tanggal,
+        ROUND(SUM(duration_active_ms) / 60000.0, 1) AS durasi_menit,
+        ROUND(AVG(accuracy), 1)                      AS akurasi,
+        ROUND(AVG(focus_ratio), 1)                   AS fokus_ratio,
+        COUNT(*)::int                                AS jumlah_sesi
+      FROM study_sessions
+      WHERE student_id = $1
+        AND status = 'completed'
+        AND started_at >= NOW() - INTERVAL '7 days'
+      GROUP BY DATE(started_at AT TIME ZONE 'Asia/Jakarta')
+      ORDER BY tanggal
+    `, [req.params.student_id]);
+
+    const s = await db.query(
+      'SELECT daily_target_minutes, weekly_target_days FROM students WHERE id = $1',
+      [req.params.student_id]
+    );
+
+    res.json({
+      summary:      r.rows[0],
+      daily_detail: daily.rows,
+      targets:      s.rows[0] || { daily_target_minutes: 30, weekly_target_days: 5 },
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
