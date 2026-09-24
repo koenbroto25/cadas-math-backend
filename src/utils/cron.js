@@ -7,6 +7,7 @@
  */
 const cron = require('node-cron');
 const { sendNightReminders, sendMissedScheduleNotifs, sendWeeklySummaryNotifs } = require('./notify');
+const finance = require('../services/financeReportService');
 
 function initCron() {
   // F-1: Jam 20:00 WIB setiap hari (UTC+7 = 13:00 UTC)
@@ -28,6 +29,12 @@ function initCron() {
     }
   }, { timezone: 'UTC' });
 
+  // M8 finance: expire referrer windows secara otomatis dan audit setiap 15 menit.
+  cron.schedule('*/15 * * * *', async () => {
+    try { await finance.runFinanceMaintenance(); }
+    catch (err) { console.error('[cron] finance maintenance error:', err.message); }
+  }, { timezone: 'UTC' });
+
   // F-5: Minggu malam jam 20:00 WIB (UTC = 13:00, DOW = 0 = Minggu)
   cron.schedule('0 13 * * 0', async () => {
     console.log('[cron] Weekly summary dimulai...');
@@ -38,7 +45,7 @@ function initCron() {
     }
   }, { timezone: 'UTC' });
 
-  console.log('[cron] Cron jobs aktif: night reminder + missed schedule + weekly summary');
+  console.log('[cron] Cron jobs aktif: night reminder + missed schedule + weekly summary + finance expiry');
 }
 
 module.exports = { initCron };

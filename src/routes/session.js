@@ -8,6 +8,7 @@ const express = require('express');
 const router  = express.Router();
 const db      = require('../database/db');
 const { verifyToken } = require('../middleware/auth');
+const { getCardGate, cardGateBlockBody } = require('../middleware/card-gate');
 const { sendSessionResultNotif, sendDistractionNotif } = require('../utils/notify');
 
 // POST /api/session/start
@@ -15,6 +16,16 @@ router.post('/start', verifyToken, async (req, res) => {
   try {
     const studentId = req.auth.id;
     const { level } = req.body;
+
+    // A1 / OQ-3: kartu ID wajib dibagikan sebelum latihan (siswa baru).
+    // Enforcement di sini pakai token → tidak bisa dilewati dgn menghapus
+    // ?student_id dari GET /api/exercises/:level.
+    if (req.auth.role === 'student') {
+      const gate = await getCardGate(db, studentId);
+      if (gate.required) {
+        return res.status(403).json(cardGateBlockBody());
+      }
+    }
 
     // Tandai sesi aktif sebelumnya sebagai incomplete (safety)
     await db.query(`

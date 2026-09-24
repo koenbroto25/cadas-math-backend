@@ -8,9 +8,16 @@
  *   'trial'    — trial_level >= level (5 soal gratis, belum bayar)
  *   'locked'   — level belum dibuka sama sekali
  *
+ * CHAMPIONSHIP GATE (Placement_Test_System.md §5.8):
+ *   Level >= 10 (di atas boss level 9) membutuhkan boss_gate_status.defeated
+ *   di boss level 9. Jika belum dikalahkan → 'boss_locked' walau sudah dibayar.
+ *   (Placement sendiri max menempatkan siswa di level 9.)
+ *
  * Trial quota (5 soal) di-enforce di exercises.js — bukan di sini.
  * getLevelAccess hanya menentukan TIPE akses, bukan apakah quota habis.
  */
+
+const BOSS_GATE_LEVEL = 9; // boss battle championship di level 9
 
 async function getLevelAccess(pool, studentId, level) {
   const result = await pool.query(
@@ -25,6 +32,19 @@ async function getLevelAccess(pool, studentId, level) {
 
   const s   = result.rows[0];
   const lvl = parseInt(level, 10);
+
+  // ── Championship gate: level di atas boss wajib kalahkan boss dulu ──────
+  if (lvl > BOSS_GATE_LEVEL) {
+    const gate = await pool.query(
+      'SELECT defeated FROM boss_gate_status WHERE student_id = $1 AND boss_level = $2',
+      [studentId, BOSS_GATE_LEVEL]
+    );
+    const defeated = gate.rows[0]?.defeated === true;
+    if (!defeated) {
+      // Gate tertutup — akses diblokir terlepas dari status pembayaran
+      return 'boss_locked';
+    }
+  }
 
   // Premium — akses penuh + AskKak
   if (s.paid_premium_up_to_level !== null && s.paid_premium_up_to_level >= lvl) {

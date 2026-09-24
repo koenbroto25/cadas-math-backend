@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
@@ -30,6 +30,7 @@ app.use('/api/placement',    require('./routes/placement'));
 app.use('/api/upgrade-test', require('./routes/upgrade-test'));
 app.use('/api/rag',          require('./routes/rag'));
 app.use('/api/payment',      require('./routes/payment'));
+app.use('/api/admin/finance', require('./routes/finance'));    // M8 finance — ledger, liability, payout, reports
 app.use('/api/admin',        require('./routes/admin'));       // Sprint D.4 - admin dashboard
 app.use('/api/referrer',     require('./routes/referrer'));    // Sprint D.3+D.5 - referrer auth+dashboard
 app.use('/api/teacher',      require('./routes/teacher'));     // Sprint F
@@ -38,6 +39,8 @@ app.use('/api/session',      require('./routes/session'));     // Sprint S-2 ses
 app.use('/api/schedule',     require('./routes/schedule'));    // Sprint S-3 jadwal belajar
 app.use('/api/device-token', require('./routes/schedule'));    // Sprint S-1 FCM token (via schedule.js)
 app.use('/api/midtrans',    require('./routes/midtrans'));   // Sprint D.2 - midtrans gateway
+app.use('/api/boss',         require('./routes/boss'));       // Championship gate - boss battle L9
+app.use('/api/payments',     require('./routes/payments'));   // Auth & Payment - paket kredit level
 
 // Sprint F.5 - /api/config: konfigurasi dinamis untuk mobile (public, tanpa auth)
 // Aplikasi fetch endpoint ini saat startup, simpan ke store/AsyncStorage.
@@ -227,5 +230,3 @@ app.listen(PORT, process.env.HOST || '0.0.0.0', () => {
 });
 
 module.exports = app;
-
-

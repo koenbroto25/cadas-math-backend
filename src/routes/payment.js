@@ -8,14 +8,21 @@ const express = require('express');
 const router = express.Router();
 const db = require('../database/db');
 const { verifyToken, requireRole } = require('../middleware/auth');
+const feeMatrix = require('../utils/fee-matrix');
 
 const PRICING = { basic_single:40000, basic_bundle_3:100000, premium_single:65000, premium_bundle_3:165000, upgrade_diff:25000 };
 
+// A1 - rate mengikuti matriks owner lewat utils/fee-matrix.js (bukan lagi rate flat
+// referrers.commission_rate). Tier-kuota guru/sales + split sekolah->marketing.
 async function calcCommission(referrerCode, amountIdr) {
-  if (!referrerCode) return { referrerId: null, commission: 0 };
-  const r = await db.query("SELECT id, commission_rate FROM referrers WHERE referral_code = $1 AND status = 'approved'", [referrerCode]);
-  if (r.rowCount === 0) return { referrerId: null, commission: 0 };
-  return { referrerId: r.rows[0].id, commission: Math.round(amountIdr * parseFloat(r.rows[0].commission_rate || 0) / 100) };
+  if (!referrerCode) return { referrerId: null, commission: 0, earnings: [] };
+  const settings = await feeMatrix.getSettings();
+  const earnings = await feeMatrix.calcSplitFee(referrerCode, amountIdr, settings);
+  return {
+    referrerId: earnings.length ? earnings[0].referrerId : null,
+    commission: earnings.reduce((s, e) => s + e.amount, 0),
+    earnings,
+  };
 }
 
 // POST /api/payment/upgrade-tier
@@ -42,16 +49,44 @@ router.post('/billing/activate', async (req, res) => {
   const { student_id, product_type, level_from, level_to, amount_idr, payment_method, proof_note, referrer_code } = req.body || {};
   if (!student_id || !product_type || !level_from || !level_to || !amount_idr) return res.status(400).json({ error: 'field wajib kurang' });
   try {
-    const { referrerId, commission } = await calcCommission(referrer_code, amount_idr);
+    const { commission, earnings } = await calcCommission(referrer_code, amount_idr);
     const isPremium = product_type.startsWith('premium');
     const col = isPremium ? 'paid_premium_up_to_level' : 'paid_basic_up_to_level';
     await db.query(`UPDATE students SET ${col} = GREATEST(COALESCE(${col}, 0), $1) WHERE id = $2`, [level_to, student_id]);
-    await db.query('INSERT INTO payment_records (student_id,product_type,level_from,level_to,amount_idr,payment_method,proof_url,referrer_code,commission_amount_idr,is_confirmed,confirmed_by_admin_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,true,NOW())', [student_id,product_type,level_from,level_to,amount_idr,payment_method||'manual_transfer',proof_note||null,referrer_code||null,commission]);
-    if (referrerId) await db.query('UPDATE referrers SET total_active_referrals = total_active_referrals + 1 WHERE id = $1', [referrerId]);
+    const pr = await db.query(
+      `INSERT INTO payment_records
+         (student_id,product_type,level_from,level_to,amount_idr,payment_method,proof_url,
+          referrer_code,commission_amount_idr,is_confirmed,confirmed_by_admin_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,true,NOW())
+       RETURNING id`,
+      [student_id, product_type, level_from, level_to, amount_idr,
+       payment_method || 'manual_transfer', proof_note || null,
+       referrer_code || null, commission]);
+
+    // A4: catat baris earning berstatus "ready" supaya ikut antrean pencairan.
+    // Sebelumnya baris ini hanya menaikkan kolom total_active_referrals yang
+    // TIDAK ADA di skema -> aktivasi manual dengan kode referral selalu 500 dan
+    // fee-nya tidak pernah tercatat. Sekarang pakai utils/fee-matrix.js.
+    if (earnings.length) {
+      await feeMatrix.saveEarnings(earnings, {
+        paymentRecordId: pr.rows[0].id,
+        studentId: student_id,
+        amountIdr: amount_idr,
+      });
+    }
+
     const st = await db.query('SELECT display_name,current_level,paid_basic_up_to_level,paid_premium_up_to_level FROM students WHERE id = $1', [student_id]);
-    res.json({ ok: true, student_id, student: st.rows[0], activated: { product_type, level_from, level_to, is_premium: isPremium }, commission_idr: commission });
+    res.json({
+      ok: true, student_id, student: st.rows[0],
+      activated: { product_type, level_from, level_to, is_premium: isPremium },
+      commission_idr: commission,
+      earnings_created: earnings.map((e) => ({
+        referrer_id: e.referrerId, type: e.type, commission_rate: e.rate, commission_idr: e.amount,
+      })),
+    });
   } catch (err) { console.error(err.message); res.status(500).json({ error: err.message }); }
 });
+
 
 // GET /api/admin/billing/status/:student_id  (router di-mount di /api/admin)
 router.get('/billing/status/:student_id', async (req, res) => {

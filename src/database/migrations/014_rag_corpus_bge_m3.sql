@@ -1,4 +1,4 @@
-﻿-- Migration 014: RAG corpus generalisasi + upgrade embedding ke BGE-M3 (1024 dim)
+-- Migration 014: RAG corpus generalisasi + upgrade embedding ke BGE-M3 (1024 dim)
 -- Sebelumnya: explanations_embedding hanya index 15 baris explanations, embedding 384-dim hashing-trick.
 -- Sekarang: index ~16.276 chunks dari exercises (hint/trick/speech) + explanations (content/variants),
 --           embedding asli BGE-M3 1024-dim via Ollama lokal.

@@ -32,6 +32,7 @@ function jwtPayload(token) {
 async function runTests() {
   const run = crypto.randomUUID().slice(0, 6);
   const email = `ortu_${run}@test.id`;
+  const phone = `0812${String(Date.now()).slice(-8)}`;
 
   // 1. Register siswa — TANPA email/password (urutan [ADD] §6.2)
   let r = await req('POST', '/api/auth/student/register', { name: 'Anak Uji', kelas: '5' });
@@ -43,12 +44,12 @@ async function runTests() {
   check('student/register nama terlalu pendek → 400', r.status === 400);
 
   // 3. Register parent
-  r = await req('POST', '/api/auth/parent/register', { name: 'Ortu Uji', email, password: 'rahasia123' });
-  check('parent/register → 201 + parent_id + token', r.status === 201 && r.data.parent_id && r.data.token);
+  r = await req('POST', '/api/auth/parent/register', { name: 'Ortu Uji', email, phone, password: 'rahasia123' });
+  check('parent/register → 200 + parent.id + token', r.status === 200 && r.data.parent?.id && r.data.token);
   const parentToken = r.data.token;
 
   // 4. Duplicate email
-  r = await req('POST', '/api/auth/parent/register', { name: 'Ortu Lagi', email, password: 'rahasia123' });
+  r = await req('POST', '/api/auth/parent/register', { name: 'Ortu Lagi', email, phone: `0813${String(Date.now()).slice(-8)}`, password: 'rahasia123' });
   check('parent/register email duplikat → 409', r.status === 409);
 
   // 5. Login benar / salah
@@ -67,23 +68,18 @@ async function runTests() {
   r = await req('GET', '/api/auth/me', null, studentToken);
   check('/api/auth/me token siswa → role=student', r.status === 200 && r.data.auth.role === 'student');
 
-  // 7. Teacher register + login (dua tipe)
-  r = await req('POST', '/api/auth/teacher/register', { name: 'Guru Les', email: `guru_${run}@test.id`, password: 'rahasia123', teacher_type: 'private' });
-  check('teacher/register (private) → 201, verified=false', r.status === 201 && r.data.verified === false);
-  const tToken = r.data.token;
-  r = await req('POST', '/api/auth/teacher/register', { name: 'Guru Sekolah', email: `sekolah_${run}@test.id`, password: 'rahasia123', teacher_type: 'nonsense' });
-  check('teacher/register type tidak valid → 400', r.status === 400);
-  r = await req('POST', '/api/auth/teacher/login', { email: `guru_${run}@test.id`, password: 'rahasia123' });
-  check('teacher/login → 200 + verified=false', r.status === 200 && r.data.verified === false);
+  // 7. Teacher public registration is disabled; existing teacher login remains supported.
+  r = await req('POST', '/api/auth/teacher/register', { name: 'Guru Publik', email: `guru_${run}@test.id`, password: 'rahasia123', teacher_type: 'private' });
+  check('teacher/register publik → 410 invite-only', r.status === 410, `(${r.data?.error || ''})`);
 
   // 8. Parent Gate: challenge → salah → benar
-  r = await req('GET', '/api/auth/parent-gate/challenge');
+  r = await req('GET', '/api/auth/parent-gate/challenge', null, parentToken);
   const { challenge_token, question } = r.data;
   check('parent-gate/challenge → token + pertanyaan', r.status === 200 && challenge_token && /×/.test(question), `(${question})`);
-  r = await req('POST', '/api/auth/parent-gate/verify', { challenge_token, answer: -1 });
+  r = await req('POST', '/api/auth/parent-gate/verify', { challenge_token, answer: -1 }, parentToken);
   check('parent-gate jawaban salah → 401', r.status === 401);
   const ans = jwtPayload(challenge_token).ans;
-  r = await req('POST', '/api/auth/parent-gate/verify', { challenge_token, answer: ans });
+  r = await req('POST', '/api/auth/parent-gate/verify', { challenge_token, answer: ans }, parentToken);
   check('parent-gate jawaban benar → gate_token', r.status === 200 && r.data.gate_token);
   // gate_token bisa diverifikasi /me (kind gate_pass)
   r = await req('GET', '/api/auth/me', null, r.data.gate_token);

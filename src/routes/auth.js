@@ -13,9 +13,12 @@
 const express  = require('express');
 const bcrypt   = require('bcryptjs');
 const jwt      = require('jsonwebtoken');
+const crypto   = require('crypto');
 const db       = require('../database/db');
 const { requireAuth, requireParent, signToken } = require('../middleware/auth');
 const { generateDisplayId, normalizeDisplayId, normalizePhone } = require('../utils/studentId');
+const purchasePayment = require('../services/purchasePaymentService');
+const marketingTestAccounts = require('../services/marketingTestAccountService');
 
 const router = express.Router();
 
@@ -63,7 +66,7 @@ const STUDENT_PUBLIC_COLS = `
 
 router.post('/student/register', async (req, res) => {
   try {
-    const { name, kelas, parent_phone } = req.body;
+    const { name, kelas, parent_phone, referral_code } = req.body;
 
     if (!name?.trim() || name.trim().length < 2)
       return res.status(400).json({ error: 'Nama minimal 2 karakter.' });
@@ -78,13 +81,24 @@ router.post('/student/register', async (req, res) => {
     // Normalisasi phone jika ada
     const phone_normalized = parent_phone ? normalizePhone(parent_phone) : null;
 
+    // Referral marketing: hanya kode approved + active yang boleh diatribusikan.
+    let referredBy = null;
+    const refCode = String(referral_code || '').trim();
+    if (refCode) {
+      const ref = await db.query(
+        "SELECT id FROM referrers WHERE referral_code=$1 AND status='approved' AND is_active=true",
+        [refCode]
+      );
+      if (ref.rowCount) referredBy = ref.rows[0].id;
+    }
+
     const r = await db.query(
-      `INSERT INTO students (name, kelas, display_id, parent_phone, display_name, grade_level)
-       VALUES ($1, $2, $3, $4, $1, $2)
+      `INSERT INTO students (name, kelas, display_id, parent_phone, display_name, grade_level, referred_by)
+       VALUES ($1, $2, $3, $4, $1, $2, $5)
        RETURNING id, name,
                  COALESCE(kelas, grade_level) AS kelas,
-                 display_id, parent_phone, current_level`,
-      [name.trim(), k, display_id, phone_normalized]
+                 display_id, parent_phone, current_level, referred_by`,
+      [name.trim(), k, display_id, phone_normalized, referredBy]
     );
     const student = r.rows[0];
     const token   = signToken({ id: student.id, role: 'student' });
@@ -206,7 +220,7 @@ router.get('/student/card', requireAuth, async (req, res) => {
 
 router.post('/parent/register', async (req, res) => {
   try {
-    const { name, email, password, phone, child_id } = req.body;
+    const { name, email, password, phone, child_id, referral_code } = req.body;
 
     if (!name?.trim())  return res.status(400).json({ error: 'Nama wajib diisi.' });
     if (!email?.trim()) return res.status(400).json({ error: 'Email wajib diisi.' });
@@ -227,11 +241,21 @@ router.post('/parent/register', async (req, res) => {
 
     const hashed = await bcrypt.hash(password, 10);
 
+    const refCode = String(referral_code || '').trim();
+    let referredBy = null;
+    if (refCode) {
+      const ref = await db.query(
+        "SELECT id FROM referrers WHERE referral_code=$1 AND status='approved' AND is_active=true",
+        [refCode]
+      );
+      if (ref.rowCount) referredBy = ref.rows[0].id;
+    }
+
     const r = await db.query(
-      `INSERT INTO parents (name, display_name, email, password_hash, phone)
-       VALUES ($1::text, $1::text, $2, $3, $4)
-       RETURNING id, name, email, phone`,
-      [name.trim(), email.trim().toLowerCase(), hashed, phone_normalized]
+      `INSERT INTO parents (name, display_name, email, password_hash, phone, referred_by)
+       VALUES ($1::text, $1::text, $2, $3, $4, $5)
+       RETURNING id, name, email, phone, referred_by`,
+      [name.trim(), email.trim().toLowerCase(), hashed, phone_normalized, referredBy]
     );
     const parent = r.rows[0];
 
@@ -265,6 +289,11 @@ router.post('/parent/register', async (req, res) => {
     return res.json({ token, parent, linked_children });
   } catch (err) {
     console.error('[auth/parent/register]', err);
+    // Tangani duplikat phone (parents.phone UNIQUE) agar 409, bukan 500
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'Email atau nomor HP sudah terdaftar.' });
+    }
+    console.error('parent/register error:', err.message);
     return res.status(500).json({ error: 'Server error.' });
   }
 });
@@ -314,9 +343,18 @@ router.post('/parent/add-child', requireAuth, requireParent, async (req, res) =>
     if (!sr.rows[0]) return res.status(404).json({ error: 'Siswa dengan ID tersebut tidak ditemukan.' });
 
     await linkParentChild(req.user.id, sr.rows[0].id);
+    const access = require('../services/accessService');
+    const attached = await access.attachPaidPurchasesToStudent(db, req.user.id, sr.rows[0].id);
+    for (const purchaseId of attached.purchase_ids) {
+      await purchasePayment.reconcileStudentPurchase(db, purchaseId, sr.rows[0].id);
+    }
+    const anchor = await access.getPlacementAnchor(db, sr.rows[0].id);
+    let activation = null;
+    if (anchor !== null && attached.transferred_levels > 0) {
+      activation = await access.activatePendingPurchases(db, sr.rows[0].id, anchor);
+    }
     const linked_children = await getLinkedChildren(req.user.id);
-
-    return res.json({ ok: true, linked_children });
+    return res.json({ ok: true, linked_children, transferred_levels: attached.transferred_levels, activation });
   } catch (err) {
     console.error('[auth/parent/add-child]', err);
     return res.status(500).json({ error: 'Server error.' });
@@ -374,9 +412,45 @@ router.get('/parent/children', requireAuth, requireParent, async (req, res) => {
 
 router.get('/me', requireAuth, async (req, res) => {
   try {
-    return res.json({ auth: { id: req.auth.id, role: req.auth.role, sub: req.auth.id } });
+    return res.json({ auth: { id: req.auth.id, role: req.auth.role, sub: req.auth.sub, kind: req.auth.kind || null } });
   } catch (err) {
     console.error('[auth/me]', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// ── TEACHER — Register / Login ───────────────────────────────────────────────
+// Tabel teachers sudah memiliki password_hash (migration 006). Token menyimpan
+// id dan sub agar kompatibel dengan route teacher lama yang membaca req.auth.sub.
+// Teacher registration is invite-only. Public registration is intentionally disabled.
+router.post('/teacher/register', async (req, res) => {
+  return res.status(410).json({ error: 'Registrasi guru hanya melalui invite partner yang sah.' });
+});
+
+router.post('/teacher/login', async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: 'Email dan password wajib diisi.' });
+    const r = await db.query(
+      `SELECT id, email, display_name, teacher_type, is_verified, password_hash
+       FROM teachers WHERE email = $1`,
+      [String(email).trim().toLowerCase()]
+    );
+    const teacher = r.rows[0];
+    if (!teacher || !teacher.password_hash || !await bcrypt.compare(password, teacher.password_hash)) {
+      return res.status(401).json({ error: 'Email atau password salah.' });
+    }
+    const token = signToken({ id: teacher.id, sub: teacher.id, role: 'teacher' });
+    return res.json({
+      token,
+      teacher: {
+        id: teacher.id, email: teacher.email, display_name: teacher.display_name,
+        teacher_type: teacher.teacher_type, is_verified: teacher.is_verified === true,
+      },
+      verified: teacher.is_verified === true,
+    });
+  } catch (err) {
+    console.error('[auth/teacher/login]', err);
     return res.status(500).json({ error: 'Server error.' });
   }
 });
@@ -388,9 +462,10 @@ router.get('/me', requireAuth, async (req, res) => {
 // Token: JWT Bearer (role parent) dengan expiry 2 menit (custom)
 // Validasi: hanya role parent/guru bisa akses
 
-router.get('/parent-gate/challenge', async (req, res) => {
+router.get('/parent-gate/challenge', requireAuth, requireParent, async (req, res) => {
   try {
-    const { sub: parentId } = req.auth || {};
+    const { id: authId, sub: authSub } = req.auth || {};
+    const parentId = authId || authSub;
 
     // Generate random multiplication question (2-9 × 2-9)
     const a = Math.floor(Math.random() * 8) + 2; // 2-9
@@ -418,7 +493,7 @@ router.get('/parent-gate/challenge', async (req, res) => {
 // Response: { gate_token } pada jawaban benar
 // TTL gate_token: 15 menit
 
-router.post('/parent-gate/verify', async (req, res) => {
+router.post('/parent-gate/verify', requireAuth, requireParent, async (req, res) => {
   try {
     const { challenge_token, answer } = req.body;
     if (!challenge_token || typeof answer === 'undefined') {
@@ -433,7 +508,8 @@ router.post('/parent-gate/verify', async (req, res) => {
     }
 
     // Pastikan challenge token milik user yang sedang login dan role parent_gate
-    if (decoded.role !== 'parent_gate' || decoded.parent_id !== req.auth.sub) {
+    const requestParentId = req.auth.id || req.auth.sub;
+    if (decoded.role !== 'parent_gate' || decoded.parent_id !== requestParentId) {
       return res.status(403).json({ error: 'Akses ditolak untuk challenge token ini.' });
     }
 
@@ -443,8 +519,9 @@ router.post('/parent-gate/verify', async (req, res) => {
 
     // Berikan gate_token untuk session parent selanjutnya
     const gateToken = signToken({
+      id: req.auth.id || req.auth.sub,
       role: 'parent',
-      sub: req.auth.sub,
+      sub: req.auth.id || req.auth.sub,
       kind: 'gate_pass',
       challenge_valid: true
     }, '15m');
@@ -456,7 +533,180 @@ router.post('/parent-gate/verify', async (req, res) => {
   }
 });
 
-// ── DEMO — Passcode (endpoint lama, tetap ada) ────────────────────────────────
+// ── ADMIN — Login owner (P2: A7 + A6, marketing.md bagian 5) ─────────────────
+// Dua jalur, keduanya mengeluarkan JWT role 'admin' TTL 24 jam (A6: 8j → 24j):
+//   1. POST /admin/login      { email, password }  — jalur password (jalur kedua)
+//   2. POST /admin/pin-login  { pin }              — PIN 4 digit via link khusus owner
+// Rate-limit: maks 10 percobaan gagal / 15 menit / IP (PIN pendek rawan brute-force).
+// Env: ADMIN_EMAIL, ADMIN_PASSWORD_HASH (bcrypt), ADMIN_PIN_HASH (bcrypt PIN 4 digit).
+// Fallback plain (ADMIN_PASSWORD / ADMIN_PIN) HANYA untuk dev (NODE_ENV !== 'production').
+
+const ADMIN_SESSION_TTL   = '24h';
+const ADMIN_RATE_MAX      = 10;                    // percobaan gagal per window
+const ADMIN_RATE_WINDOWMS = 15 * 60 * 1000;        // 15 menit
+const adminRateBuckets    = new Map();             // ip -> { count, resetAt }
+
+// A7 + migrasi 023: jejak percobaan PIN di tabel `admin_pin_attempts` supaya
+// lockout tetap berlaku setelah backend restart. Jika DB bermasalah, login tetap
+// jalan memakai limiter in-memory (fail-open terkendali, bukan 500).
+async function recordPinAttempt(ip, success) {
+  try {
+    await db.query('INSERT INTO admin_pin_attempts (ip, success) VALUES ($1, $2)', [ip, success]);
+  } catch (e) { console.warn('[auth/pin-rate] gagal catat attempt:', e.message); }
+}
+
+// Jumlah kegagalan PIN dalam 15 menit terakhir untuk IP ini, dihitung ulang
+// setiap kali ada login PIN sukses (mirror reset-on-success versi in-memory).
+async function recentPinFailures(ip) {
+  try {
+    const r = await db.query(`
+      SELECT COUNT(*)::int AS c FROM admin_pin_attempts
+       WHERE ip = $1 AND success = false
+         AND created_at > GREATEST(
+               NOW() - INTERVAL '15 minutes',
+               COALESCE((SELECT MAX(created_at) FROM admin_pin_attempts
+                          WHERE ip = $1 AND success = true),
+                        NOW() - INTERVAL '15 minutes'))`, [ip]);
+    return (r.rows[0] && r.rows[0].c) || 0;
+  } catch (e) { return 0; }
+}
+
+function adminRateIp(req) {
+  const fwd = req.headers['x-forwarded-for'];
+  if (typeof fwd === 'string' && fwd.length) return fwd.split(',')[0].trim();
+  return (req.socket && req.socket.remoteAddress) || 'unknown';
+}
+
+// Ambil bucket rate-limit utk IP ini; kirim 429 & return null jika terkunci.
+function adminRateBucket(req, res) {
+  const ip = adminRateIp(req);
+  const now = Date.now();
+  let bucket = adminRateBuckets.get(ip);
+  if (!bucket || bucket.resetAt <= now) {
+    bucket = { count: 0, resetAt: now + ADMIN_RATE_WINDOWMS };
+    adminRateBuckets.set(ip, bucket);
+    if (adminRateBuckets.size > 10000) { // housekeeping sederhana
+      for (const [k, b] of adminRateBuckets) if (b.resetAt <= now) adminRateBuckets.delete(k);
+    }
+  }
+  if (bucket.count >= ADMIN_RATE_MAX) {
+    const waitMin = Math.ceil((bucket.resetAt - now) / 60000);
+    res.status(429).json({ error: `Terlalu banyak percobaan gagal. Coba lagi dalam ${waitMin} menit.` });
+    return null;
+  }
+  return bucket;
+}
+
+// Bandingkan secret tanpa membocorkan waktu (untuk fallback plain;
+// bcrypt.compare sendiri sudah time-safe).
+function timingSafeEqualStr(a, b) {
+  const ab = Buffer.from(String(a), 'utf8');
+  const bb = Buffer.from(String(b), 'utf8');
+  if (ab.length !== bb.length) {
+    crypto.timingSafeEqual(ab, ab); // sama-sama kerja agar timing setara
+    return false;
+  }
+  return crypto.timingSafeEqual(ab, bb);
+}
+
+// Verifikasi secret admin: hash bcrypt diutamakan; plain fallback hanya dev.
+async function verifyAdminSecret(plain, hashKey, plainKey) {
+  const hash = process.env[hashKey];
+  if (hash) {
+    try { return await bcrypt.compare(String(plain), hash); } catch (_) { return false; }
+  }
+  const fallback = process.env[plainKey];
+  if (fallback && process.env.NODE_ENV !== 'production') {
+    return timingSafeEqualStr(plain, fallback);
+  }
+  return false;
+}
+
+function adminSessionResponse() {
+  const email = process.env.ADMIN_EMAIL || 'admin';
+  const token = signToken({ sub: 'admin', role: 'admin', email }, ADMIN_SESSION_TTL);
+  return {
+    ok: true,
+    admin_token: token,
+    expires_in: ADMIN_SESSION_TTL,
+    profile: { email, role: 'admin' },
+  };
+}
+
+// POST /api/auth/admin/login — jalur password (dulu dijanakan Sprint K.9; 404 sebelumnya)
+router.post('/admin/login', async (req, res) => {
+  const bucket = adminRateBucket(req, res);
+  if (!bucket) return;
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: 'email dan password wajib diisi.' });
+    const emailOk = !!process.env.ADMIN_EMAIL &&
+      String(email).trim().toLowerCase() === String(process.env.ADMIN_EMAIL).trim().toLowerCase();
+    const passOk  = await verifyAdminSecret(password, 'ADMIN_PASSWORD_HASH', 'ADMIN_PASSWORD');
+    if (!emailOk || !passOk) {
+      bucket.count++;
+      return res.status(401).json({ error: 'Email atau password admin salah.' });
+    }
+    bucket.count = 0; // sukses → reset counter IP ini
+    return res.json(adminSessionResponse());
+  } catch (err) {
+    console.error('[auth/admin/login]', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// POST /api/auth/admin/pin-login — PIN 4 digit via link khusus owner (marketing.md bagian 5)
+router.post('/admin/pin-login', async (req, res) => {
+  const bucket = adminRateBucket(req, res);
+  if (!bucket) return;
+  const ip = adminRateIp(req);
+  try {
+    // Lockout lintas-restart: hitung kegagalan dari DB (migrasi 023).
+    if (await recentPinFailures(ip) >= ADMIN_RATE_MAX) {
+      return res.status(429).json({ error: 'Terlalu banyak percobaan gagal. Coba lagi dalam 15 menit.' });
+    }
+    const pinStr = String((req.body || {}).pin == null ? '' : (req.body || {}).pin).trim();
+    const isFourDigits = pinStr.length === 4 && Array.from(pinStr).every(c => c >= '0' && c <= '9');
+    if (!isFourDigits) return res.status(400).json({ error: 'PIN harus 4 angka.' });
+
+    const ok = await verifyAdminSecret(pinStr, 'ADMIN_PIN_HASH', 'ADMIN_PIN');
+    if (!ok) {
+      bucket.count++;
+      await recordPinAttempt(ip, false);
+      const left = Math.max(0, ADMIN_RATE_MAX - bucket.count);
+      return res.status(401).json({ error: `PIN salah. Sisa percobaan: ${left}.` });
+    }
+    await recordPinAttempt(ip, true);
+    bucket.count = 0;
+    return res.json(adminSessionResponse());
+  } catch (err) {
+    console.error('[auth/admin/pin-login]', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// ── MARKETING TEST ID — M7 ───────────────────────────────────────────────────
+// Redeem one-time preview code. Tidak membuat akun siswa, payment, earning,
+// session, atau progress. JWT hanya memberi preview mode selama sisa TTL.
+router.post('/test-account/redeem', async (req, res) => {
+  try {
+    const code = String(req.body?.code || '').trim();
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || null;
+    const preview = await marketingTestAccounts.redeemTestAccount({ code, ip });
+    const ttlSeconds = Math.max(1, Math.floor((new Date(preview.expires_at).getTime() - Date.now()) / 1000));
+    const token = signToken({
+      role: 'demo', kind: 'marketing_test', label: preview.label,
+      test_account_id: preview.id, owner_referrer_id: preview.owner_referrer_id,
+      no_persist: true, scope: 'preview_all_levels',
+    }, `${ttlSeconds}s`);
+    return res.json({ ok: true, token, label: preview.label, expires_at: preview.expires_at, scope: 'preview_all_levels' });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    console.error('[auth/test-account/redeem]', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
 
 router.post('/demo/redeem', async (req, res) => {
   try {
@@ -465,14 +715,15 @@ router.post('/demo/redeem', async (req, res) => {
       return res.status(400).json({ error: 'Passcode harus 4 angka.' });
 
     const r = await db.query(
-      `SELECT id, label, expires_at FROM demo_passcodes
+      `SELECT id, label, expires_at, no_persist FROM demo_passcodes
        WHERE code = $1 AND is_active = true AND expires_at > now()`,
       [String(code)]
     );
     if (!r.rows[0]) return res.status(404).json({ error: 'Passcode tidak valid atau sudah kadaluarsa.' });
 
-    const { label, expires_at } = r.rows[0];
-    const token = signToken({ role: 'demo', kind: 'client', label }, '30d');
+    const { label, expires_at, no_persist } = r.rows[0];
+    // A3: flag no_persist ikut di token agar route progress bisa skip simpan sesi.
+    const token = signToken({ role: 'demo', kind: 'client', label, no_persist: no_persist === true }, '30d');
 
     return res.json({ ok: true, token, label, expires_at });
   } catch (err) {

@@ -6,20 +6,36 @@
  */
 const express = require('express');
 const db      = require('../database/db');
+const jwt    = require('jsonwebtoken');
 
 const router  = express.Router();
 const TRIAL_LIMIT = 5;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const JWT_SECRET = process.env.JWT_SECRET || 'cadas_app_secure_secret_key_2026';
+
+// A3: deteksi token demo dengan flag no_persist → sesi TIDAK disimpan DB.
+function isDemoNoPersist(req) {
+  const header = req.headers.authorization || '';
+  if (!header.startsWith('Bearer ')) return false;
+  try {
+    const payload = jwt.verify(header.slice(7), JWT_SECRET);
+    return payload.role === 'demo' && payload.no_persist === true;
+  } catch (_) { return false; }
+}
 
 // Helper: update trial usage
 async function updateTrialUsage(studentId, levelId, questionsAnswered) {
   await db.query(
+    // NOTE: $3 & $4 WAJIB di-cast ::int. Tanpa cast, PostgreSQL mendeduksi $3
+    // dua kali (kolom questions_used = integer vs perbandingan `$3 >= $4` yang
+    // kedua sisinya unknown) → "inconsistent types deduced for parameter $3"
+    // → HTTP 500, kuota trial tidak pernah bertambah.
     `INSERT INTO student_trial_usage (student_id, level_id, questions_used, exhausted, last_used_at)
-     VALUES ($1, $2, $3, $3 >= $4, NOW())
+     VALUES ($1, $2, $3::int, ($3::int >= $4::int), NOW())
      ON CONFLICT (student_id, level_id) DO UPDATE
-       SET questions_used = LEAST(student_trial_usage.questions_used + $3, $4),
-           exhausted      = (student_trial_usage.questions_used + $3) >= $4,
+       SET questions_used = LEAST(student_trial_usage.questions_used + $3::int, $4::int),
+           exhausted      = (student_trial_usage.questions_used + $3::int) >= $4::int,
            last_used_at   = NOW()`,
     [studentId, levelId, questionsAnswered, TRIAL_LIMIT]
   );
@@ -33,6 +49,11 @@ async function updateTrialUsage(studentId, levelId, questionsAnswered) {
 // POST /api/progress/session
 router.post('/session', async (req, res) => {
   const { student_id, device_id, level, results } = req.body || {};
+
+  // A3: demo passcode no_persist → hasil latihan tidak masuk DB (uji coba murni).
+  if (isDemoNoPersist(req)) {
+    return res.json({ ok: true, saved: false, reason: 'demo_no_persist' });
+  }
 
   if (!Array.isArray(results) || results.length === 0) {
     return res.status(400).json({ error: 'results wajib array berisi jawaban' });

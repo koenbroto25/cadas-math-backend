@@ -1,12 +1,12 @@
 ﻿/**
- * RAG Pipeline â€” 5-layer hybrid (v2 â€” 15 Sep 2026)
+ * RAG Pipeline — 5-layer hybrid (v2 — 15 Sep 2026)
  *
  * Layer 1 : Lexical Search  (ILIKE + JS scoring)
  * Layer 2 : Semantic Search (pgvector BGE-M3 1024-dim)
- * Layer 3 : LLM primary  â€” Gemini direct (200 key, gemini-client.js)
- * Layer 4 : LLM fallback â€” OpenRouter generateWithFallback() (93 key)
- * Post-LLM: math-validator (mathjs + soal-cerita.js) â€” verifikasi & koreksi
- * Layer 5 : Normalize â†’ Output by access level
+ * Layer 3 : LLM primary  — Gemini direct (200 key, gemini-client.js)
+ * Layer 4 : LLM fallback — OpenRouter generateWithFallback() (93 key)
+ * Post-LLM: math-validator (mathjs + soal-cerita.js) — verifikasi & koreksi
+ * Layer 5 : Normalize → Output by access level
  *
  * Perubahan dari v1:
  *   - LLM: Gemini direct JADI primary (200 key), OpenRouter jadi fallback
@@ -28,12 +28,12 @@ const {
   validateWithWordProblem,
 } = require('./math-validator');
 
-// Gemini direct client (primary LLM â€” 200 key)
+// Gemini direct client (primary LLM — 200 key)
 let gemini = null;
 try {
   gemini = require('./gemini-client');
 } catch {
-  console.warn('[RAG] gemini-client.js tidak ditemukan â€” Layer 3 Gemini direct dinonaktifkan');
+  console.warn('[RAG] gemini-client.js tidak ditemukan — Layer 3 Gemini direct dinonaktifkan');
 }
 
 // Konfigurasi embedding Ollama (BGE-M3 1024-dim)
@@ -53,7 +53,7 @@ const SEM_TOP_K   = parseInt(process.env.RAG_SEM_TOP_K     || '5', 10);
 // ============================================================
 
 /**
- * generateEmbedding(text) â†’ number[] | null
+ * generateEmbedding(text) → number[] | null
  * Embed teks via BGE-M3 Ollama lokal, return vector 1024-dim.
  */
 async function generateEmbedding(text) {
@@ -193,7 +193,7 @@ async function lexicalSearch(question, level, conceptId) {
 // ============================================================
 
 /**
- * semanticSearch(question, level, conceptId) â†’ SemanticResult
+ * semanticSearch(question, level, conceptId) → SemanticResult
  * Baca langsung dari explanations_embedding.chunk_text (bukan JOIN ke explanations).
  * Corpus: ~16.244 chunks dari exercises + explanations.
  * Priority: quick_trick > hint_text > speech_text > explanation
@@ -285,7 +285,7 @@ async function llmFallback(question, level, conceptId, fewShotContext, studentId
   let model = null;
   let layer = null;
 
-  // â”€â”€ Layer 3: Gemini direct (primary â€” 200 key rotasi) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ── Layer 3: Gemini direct (primary — 200 key rotasi) ─────────────────────
   if (gemini && gemini.available) {
     try {
       const result = await gemini.generate(question, {
@@ -300,7 +300,7 @@ async function llmFallback(question, level, conceptId, fewShotContext, studentId
     }
   }
 
-  // â”€â”€ Layer 4: OpenRouter (fallback â€” 93 key, generateWithFallback) â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ── Layer 4: OpenRouter (fallback — 93 key, generateWithFallback) ─────────
   if (!text && openrouter.available) {
     try {
       const result = await openrouter.generateWithFallback(question, {
@@ -320,7 +320,7 @@ async function llmFallback(question, level, conceptId, fewShotContext, studentId
     return { hit: 'none', source: 'llm', reason: 'All LLM layers failed' };
   }
 
-  // â”€â”€ Post-LLM Math Validator â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ── Post-LLM Math Validator ───────────────────────────────────────────────
   // Coba validateWithWordProblem (soal cerita aware) dulu,
   // fallback ke validateMathAnswer (ekspresi matematika eksplisit).
   let validation = validateWithWordProblem(text, question);
@@ -328,7 +328,7 @@ async function llmFallback(question, level, conceptId, fewShotContext, studentId
     validation = validateMathAnswer(text, question);
   }
   const finalText = validation.validated ? validation.llmText : text;
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ─────────────────────────────────────────────────────────────────────────
 
   // Update quota harian
   try {
@@ -345,7 +345,7 @@ async function llmFallback(question, level, conceptId, fewShotContext, studentId
   }
 
   // Log biaya LLM
-  // Gemini direct: ~$0.10/M in + $0.40/M out â‰ˆ $0.0001/call
+  // Gemini direct: ~$0.10/M in + $0.40/M out ≈ $0.0001/call
   // OpenRouter gpt-4o-mini: ~$0.0002/call
   // OpenRouter gemini-lite: ~$0.0001/call
   const estimatedCost = layer === 3 ? 0.0001 : 0.0002;
@@ -472,7 +472,7 @@ async function askKak({ studentId, questionText, conceptId, level, accessType })
   let fewShotContext = [];
   let llmMeta        = null;
 
-  // â”€â”€ Step 1: Lexical Search â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ── Step 1: Lexical Search ─────────────────────────────────────────────────
   const lexical = await lexicalSearch(questionText, level, conceptId);
   logStage('layer1-lexical', 'found=' + lexical.found);
   if (lexical.hit === 'strong') {
@@ -480,7 +480,7 @@ async function askKak({ studentId, questionText, conceptId, level, accessType })
     source     = 'lexical';
   }
 
-  // â”€â”€ Step 2: Semantic Search (BGE-M3) â€” PRIMARY SOURCE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ── Step 2: Semantic Search (BGE-M3) — PRIMARY SOURCE ─────────────────────
   if (!answerText) {
     const semantic = await semanticSearch(questionText, level, conceptId);
     logStage('layer2-semantic', 'found=' + semantic.found);
@@ -493,7 +493,7 @@ async function askKak({ studentId, questionText, conceptId, level, accessType })
     }
   }
 
-  // â”€â”€ Step 3+4: LLM Fallback (premium only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ── Step 3+4: LLM Fallback (premium only) ─────────────────────────────────
   if (!answerText && accessType === 'premium') {
     const llmResult = await llmFallback(questionText, level, conceptId, fewShotContext, studentId);
     logStage('layer34-llm', 'quotaExhausted=' + (llmResult.quotaExhausted || false) + ' layer=' + (llmResult.layer || '-') + ' model=' + (llmResult.model || '-'));
@@ -509,7 +509,7 @@ async function askKak({ studentId, questionText, conceptId, level, accessType })
     }
   }
 
-  // â”€â”€ Tidak ada jawaban â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ── Tidak ada jawaban ───────────────────────────────────────────────────────
   if (!answerText) {
     if (accessType !== 'premium') {
       const notFoundMsg = `Belum ada jawaban untuk pertanyaan itu di Level ${level}. Coba tanya dengan kata lain, atau upgrade ke Premium untuk jawaban langsung dari Kak Cadas!`;
@@ -520,7 +520,7 @@ async function askKak({ studentId, questionText, conceptId, level, accessType })
     source     = 'fallback';
   }
 
-  // â”€â”€ Step 5: Normalize + Output â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ── Step 5: Normalize + Output ──────────────────────────────────────────────
   logStage('layer5-output', 'len=' + String(answerText || '').length);
   const output = await generateOutput(answerText, level, accessType, conceptId);
   await cacheQuestion(studentId, questionText, questionHash, conceptId, level, source, output.text, output.audioUrl, accessType === 'premium');
@@ -581,11 +581,11 @@ function buildSystemPrompt(level, conceptId, fewShotContext = []) {
 ATURAN WAJIB:
 1. Jawab HANYA pertanyaan matematika Level ${level}. Tolak sopan jika di luar topik matematika.
 2. Gunakan bahasa Indonesia sederhana, mudah dipahami anak SD.
-3. Jelaskan LANGKAH-LANGKAH penyelesaian â€” jangan langsung sebut jawaban akhir di awal.
+3. Jelaskan LANGKAH-LANGKAH penyelesaian — jangan langsung sebut jawaban akhir di awal.
 4. Semua kalkulasi HARUS 100% benar. Hitung ulang sebelum menulis angka.
 5. Jika ada trik cepat GASING, sebutkan sebagai opsi.
 6. Untuk soal cerita: bantu siswa pahami yang diketahui dan ditanyakan dulu.
-7. Respons singkat dan padat â€” maksimal 150 kata. Tidak perlu basa-basi panjang.
+7. Respons singkat dan padat — maksimal 150 kata. Tidak perlu basa-basi panjang.
 8. DILARANG mengarang angka atau hasil yang tidak dihitung dengan benar.`;
 
   if (fewShotContext.length > 0) {

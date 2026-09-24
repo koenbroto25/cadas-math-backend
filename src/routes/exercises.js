@@ -8,9 +8,16 @@
  *   Siswa dengan akses 'trial' hanya dapat 5 soal pertama (ORDER BY source_id).
  *   Setelah 5 soal dikerjakan (dicatat via POST /api/progress/session),
  *   level_access berubah jadi 'trial_exhausted' → frontend redirect ke paywall.
+ *
+ * Card gate (A1 / OQ-3 FINAL):
+ *   Siswa baru wajib membagikan kartu ID (students.card_shared = true) sebelum
+ *   latihan. Gate di sini untuk jalur lama yang mengirim ?student_id=xxx;
+ *   enforcement utama di POST /api/session/start (pakai token, tidak bisa
+ *   dipalsukan). Lihat middleware/card-gate.js.
  */
 const express = require('express');
 const db      = require('../database/db');
+const { getCardGate, cardGateBlockBody } = require('../middleware/card-gate');
 
 const router = express.Router();
 
@@ -55,6 +62,12 @@ router.get('/:level', async (req, res) => {
           message: 'Level ini belum dibuka. Selesaikan trial atau bayar untuk akses penuh.',
           level_access: 'locked',
         });
+      }
+
+      // A1 / OQ-3: kartu ID wajib dibagikan sebelum latihan (siswa baru).
+      const gate = await getCardGate(db, studentId);
+      if (gate.required) {
+        return res.status(403).json({ ...cardGateBlockBody(), level_access: access });
       }
 
       if (access === 'trial') {
@@ -163,6 +176,12 @@ router.get('/level-info/:level_id', async (req, res) => {
         } else {
           row.level_access = access; // 'basic' | 'premium' | 'locked'
         }
+
+        // A1 / OQ-3: info gate kartu ID (dipakai PracticeScreen/HomeScreen untuk
+        // menampilkan modal kartu sebelum latihan). Additive — tidak mengubah
+        // respons lama.
+        const gate = await getCardGate(db, studentId);
+        row.card_gate = { required: gate.required, card_shared: gate.card_shared };
       } catch (e) {
         console.warn('[level-info] getLevelAccess error:', e.message);
         row.level_access = 'trial';

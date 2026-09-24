@@ -13,13 +13,16 @@ const db      = require('../database/db');
 const axios   = require('axios');
 const http    = require('http');
 const https   = require('https');
-// Paksa IPv4 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â hindari ECONNRESET di jaringan dual-stack
+// Paksa IPv4 — hindari ECONNRESET di jaringan dual-stack
 const ipv4Agent = {
   httpAgent:  new http.Agent({ family: 4 }),
   httpsAgent: new https.Agent({ family: 4 }),
 };
 const crypto  = require('crypto');
 const { verifyToken, requireRole } = require('../middleware/auth');
+const feeMatrix = require('../utils/fee-matrix');
+const purchasePayment = require('../services/purchasePaymentService');
+const finance = require('../services/financeReportService');
 
 const MT_SERVER_KEY = process.env.MIDTRANS_SERVER_KEY || '';
 const MT_IS_SANDBOX = process.env.MIDTRANS_SANDBOX !== 'false';
@@ -36,83 +39,23 @@ const PRICING = {
 };
 
 // Sprint I — getSettings + calcSplitFee + saveEarnings (identik admin.js)
+// A1 - matriks fee tunggal: utils/fee-matrix.js (dipakai juga admin.js & payment.js)
 async function getSettings() {
-  const rows = await db.query('SELECT key, value FROM referral_settings');
-  return Object.fromEntries(rows.rows.map(r => [r.key, r.value]));
+  return feeMatrix.getSettings();
+}
+
+// Tier-kuota: guru/sekolah >=100 siswa bayar -> 20%, 50-99 -> 10%, <50 -> 0%;
+// sales >=10 -> 10%; head marketing flat 10%; parent/student 0% (keputusan owner P1).
+async function calcSplitFee(referrerCode, amountIdr, settings, opts) {
+  return feeMatrix.calcSplitFee(referrerCode, amountIdr, settings, opts);
+}
+
+// A4 - baris earning langsung berstatus "ready" supaya masuk antrean pencairan.
+async function saveEarnings(earnings, paymentRecordId, midtransInvoiceId, studentId, amountIdr) {
+  return feeMatrix.saveEarnings(earnings, { paymentRecordId, midtransInvoiceId, studentId, amountIdr, status: 'ready' });
 }
 
 const { v4: uuidv4 } = require('uuid');
-
-async function calcSplitFee(referrerCode, amountIdr, settings) {
-  if (!referrerCode) return [];
-  const ref = await db.query(
-    "SELECT id, type, commission_rate, is_active FROM referrers WHERE referral_code = $1 AND status = 'approved'",
-    [referrerCode]
-  );
-  if (ref.rowCount === 0 || !ref.rows[0].is_active) return [];
-  const referrer    = ref.rows[0];
-  const splitActive = settings.split_fee_enabled === 'true';
-  const results     = [];
-  const splitGroupId = uuidv4();
-
-  if (referrer.type === 'school') {
-    if (settings.school_enabled !== 'true') return [];
-    const rate   = parseFloat(referrer.commission_rate) || parseFloat(settings.school_rate) || 30;
-    const amount = Math.round(amountIdr * rate / 100);
-    results.push({ referrerId: referrer.id, type: 'school', rate, amount, splitGroupId });
-    if (splitActive && settings.marketing_enabled === 'true') {
-      const link = await db.query(
-        `SELECT sml.marketing_id, r.commission_rate, r.is_active
-           FROM school_marketing_links sml
-           JOIN referrers r ON r.id = sml.marketing_id
-          WHERE sml.school_id = $1 AND sml.is_active = true AND r.is_active = true
-          LIMIT 1`,
-        [referrer.id]
-      );
-      if (link.rowCount > 0) {
-        const mRate   = parseFloat(link.rows[0].commission_rate) || parseFloat(settings.marketing_rate) || 10;
-        const mAmount = Math.round(amountIdr * mRate / 100);
-        results.push({ referrerId: link.rows[0].marketing_id, type: 'marketing', rate: mRate, amount: mAmount, splitGroupId });
-      }
-    }
-  } else if (referrer.type === 'marketing') {
-    if (settings.marketing_enabled !== 'true') return [];
-    const rate   = parseFloat(referrer.commission_rate) || parseFloat(settings.marketing_rate) || 10;
-    const amount = Math.round(amountIdr * rate / 100);
-    results.push({ referrerId: referrer.id, type: 'marketing', rate, amount, splitGroupId });
-  } else if (referrer.type === 'parent') {
-    if (settings.parent_enabled !== 'true') return [];
-    const rate   = parseFloat(referrer.commission_rate) || parseFloat(settings.parent_rate) || 5;
-    const amount = Math.round(amountIdr * rate / 100);
-    results.push({ referrerId: referrer.id, type: 'parent', rate, amount, splitGroupId });
-  } else if (referrer.type === 'student') {
-    if (settings.student_enabled !== 'true') return [];
-    const rate   = parseFloat(referrer.commission_rate) || parseFloat(settings.student_rate) || 5;
-    const amount = Math.round(amountIdr * rate / 100);
-    results.push({ referrerId: referrer.id, type: 'student', rate, amount, splitGroupId });
-  }
-  return results;
-}
-
-async function saveEarnings(earnings, paymentRecordId, midtransInvoiceId, studentId, amountIdr) {
-  for (const e of earnings) {
-    await db.query(
-      `INSERT INTO referrer_earnings
-         (referrer_id, payment_record_id, midtrans_invoice_id, student_id,
-          amount_idr, commission_rate, commission_idr, split_group_id, referrer_type)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [e.referrerId, paymentRecordId, midtransInvoiceId, studentId,
-       amountIdr, e.rate, e.amount, e.splitGroupId, e.type]
-    );
-    await db.query(
-      `UPDATE referrers SET
-         total_conversions  = total_conversions + 1,
-         total_earnings_idr = total_earnings_idr + $1
-       WHERE id = $2`,
-      [e.amount, e.referrerId]
-    );
-  }
-}
 
 function verifySignature(orderId, statusCode, grossAmount) {
   const raw = `${orderId}${statusCode}${grossAmount}${MT_SERVER_KEY}`;
@@ -224,7 +167,24 @@ router.post('/webhook', async (req, res) => {
       return res.status(404).json({ error: 'order tidak ditemukan' });
     }
     const invoice = inv.rows[0];
+    const gross = Number(gross_amount);
+    if (!Number.isFinite(gross) || Math.round(gross * 100) !== Math.round(Number(invoice.amount_idr) * 100)) {
+      return res.status(400).json({ error: 'nominal webhook tidak cocok dengan invoice' });
+    }
 
+    // Invoice dari jalur purchase baru (QRIS utama).
+    if (invoice.purchase_id) {
+      if (isPaid) {
+        const purchaseResult = await purchasePayment.settlePaidInvoice(invoice, { transaction_id, payment_type });
+        await finance.recordSettlement({ ...invoice, paid_at: new Date() });
+        return res.json({ ok: true, activated: true, ...purchaseResult });
+      }
+      const newStatus = isExpired ? 'expired' : isFailed ? 'failed' : transaction_status;
+      await purchasePayment.markInvoiceStatus(invoice, newStatus, { transaction_id, payment_type });
+      return res.json({ ok: true, status: newStatus });
+    }
+
+    // Legacy invoice (tanpa purchase_id) — backward compatibility.
     if (!isPaid) {
       const newStatus = isExpired ? 'expired' : isFailed ? 'failed' : transaction_status;
       await db.query(
@@ -246,6 +206,9 @@ router.post('/webhook', async (req, res) => {
        SET status='paid', paid_at=NOW(), midtrans_transaction_id=$1, payment_type=$2
        WHERE id=$3`,
       [transaction_id || null, payment_type || null, invoice.id]);
+
+    // Catat settlement legacy agar finance cash ledger tetap lengkap.
+    await finance.recordSettlement({ ...invoice, status:'paid', paid_at: new Date() });
 
     // Catat komisi referrer — split fee sekolah+marketing (Sprint I)
     const settings        = await getSettings();
@@ -274,20 +237,33 @@ router.post('/webhook', async (req, res) => {
   }
 });
 
-// GET /api/midtrans/status/:order_id ÃƒÆ’Ã†’Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†’Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†’Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â cek dari DB
+// GET /api/midtrans/status/:order_id — cek dari DB
 router.get('/status/:order_id', verifyToken, async (req, res) => {
   try {
     const inv = await db.query(`
-      SELECT status, paid_at, amount_idr, product_type, level_from, level_to,
-             payment_type, va_number, midtrans_transaction_id, created_at
-      FROM midtrans_invoices WHERE midtrans_order_id = $1
+      SELECT i.status, i.paid_at, i.amount_idr, i.product_type, i.level_from, i.level_to,
+             i.payment_type, i.va_number, i.midtrans_transaction_id, i.created_at,
+             i.student_id, i.parent_id, i.purchase_id,
+             p.status AS purchase_status, p.midtrans_status, p.qr_expires_at
+      FROM midtrans_invoices i
+      LEFT JOIN purchases p ON p.id = i.purchase_id
+      WHERE i.midtrans_order_id = $1
     `, [req.params.order_id]);
     if (inv.rowCount === 0) return res.status(404).json({ error: 'order tidak ditemukan' });
-    res.json(inv.rows[0]);
+    const row = inv.rows[0];
+    const role = req.user?.role;
+    const owns = role === 'admin' ||
+      (role === 'student' && row.student_id === req.user.id) ||
+      (role === 'parent' && (row.parent_id === req.user.id || await db.query(
+        'SELECT 1 FROM parent_children WHERE parent_id=$1 AND student_id=$2',
+        [req.user.id, row.student_id]
+      ).then(x => x.rowCount > 0)));
+    if (!owns) return res.status(403).json({ error: 'akses order ditolak' });
+    res.json(row);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/midtrans/check-live/:order_id ÃƒÆ’Ã†’Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†’Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†’Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â cek langsung ke Midtrans (polling fallback)
+// GET /api/midtrans/check-live/:order_id — cek langsung ke Midtrans (polling fallback)
 router.get('/check-live/:order_id', verifyToken, async (req, res) => {
   if (!MT_SERVER_KEY) return res.status(503).json({ error: 'Midtrans belum dikonfigurasi' });
   try {

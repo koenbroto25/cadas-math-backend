@@ -10,6 +10,7 @@
 const express = require('express');
 const router  = express.Router();
 const db      = require('../database/db');
+const dashboardService = require('../services/marketingDashboardService');
 const { verifyToken, requireRole } = require('../middleware/auth');
 
 router.use(verifyToken);
@@ -35,9 +36,17 @@ router.get('/me', async (req, res) => {
       [req.auth.sub]
     );
 
+    const ref = await db.query(
+      `SELECT id, type, referral_code, referral_token FROM referrers
+        WHERE teacher_id=$1::uuid AND status='approved' AND is_active=true
+        ORDER BY created_at DESC LIMIT 1`, [req.auth.sub]
+    );
+    const marketing = ref.rows[0] ? await dashboardService.getPartnerDashboard(ref.rows[0].id) : null;
     res.json({
       teacher: t.rows[0],
-      total_students: count.rows[0].total
+      total_students: count.rows[0].total,
+      marketing,
+      linked_partner: ref.rows[0] || null
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });

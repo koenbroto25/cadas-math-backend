@@ -8,6 +8,8 @@
  * PUT  /api/admin/referrers/:id         - update referrer
  * GET  /api/admin/payments              - list semua payment
  * GET  /api/admin/earnings              - list earnings (untuk transfer)
+ * GET  /api/admin/earnings/payout-queue - antrean fee 'ready' per referrer (A4)
+ * POST /api/admin/earnings/payout       - cairkan borongan: 'ready' -> 'transferred' (A4)
  * PUT  /api/admin/earnings/:id          - mark earning as transferred
  * POST /api/admin/billing/activate      - manual activate billing
  * GET  /api/admin/billing/status/:id    - status billing siswa
@@ -22,9 +24,10 @@ const express = require('express');
 const router  = express.Router();
 const db      = require('../database/db');
 const SECRET_KEY = process.env.JWT_SECRET || 'cadas_app_secure_secret_key_2026';
+const { readyPayoutQueue, summarizeQueue } = require('../utils/payout');
 
 
-// Helper: Bearer token dengan role 'admin' (login app, TTL 8 jam)
+// Helper: Bearer token dengan role 'admin' (login app/PIN, TTL 24 jam — A6)
 function isAdminBearer(req) {
   const header = req.headers.authorization || '';
   const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
@@ -60,6 +63,9 @@ function allowAdminOrMarketing(req, res, next) {
 
 const bcrypt  = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
+const feeMatrix = require('../utils/fee-matrix');
+const partnerInvites = require('../services/partnerInviteService');
+const marketingTestAccounts = require('../services/marketingTestAccountService');
 const jwt     = require('jsonwebtoken');
 
 const SECRET = process.env.JWT_SECRET || 'cadas_app_secure_secret_key_2026';
@@ -79,96 +85,46 @@ router.use((req, res, next) => {
   return requireAdmin(req, res, next);
 });
 
-// ?? Helper: baca referral_settings dari DB ???????????????????????????????????
+// Helper: baca referral_settings dari DB
 async function getSettings() {
-  const rows = await db.query('SELECT key, value FROM referral_settings');
-  return Object.fromEntries(rows.rows.map(r => [r.key, r.value]));
+  return feeMatrix.getSettings();
 }
 
-// ?? Helper: hitung split fee (sekolah + marketing) ???????????????????????????
-// Alur: siswa punya referred_by (school_id atau marketing_id)
-// Jika siswa dari sekolah ? cek apakah sekolah punya linked marketing
-// Earnings: sekolah 30% + marketing 10% (jika split aktif)
-// Jika siswa dari marketing langsung (tanpa sekolah) ? marketing 10% saja
+// Helper: hitung split fee (sekolah + marketing)
 async function calcSplitFee(referrerCode, amountIdr, settings) {
-  if (!referrerCode) return [];
-
-  const ref = await db.query(
-    "SELECT id, type, commission_rate, is_active FROM referrers WHERE referral_code = $1 AND status = 'approved'",
-    [referrerCode]
-  );
-  if (ref.rowCount === 0 || !ref.rows[0].is_active) return [];
-
-  const referrer   = ref.rows[0];
-  const splitActive = settings.split_fee_enabled === 'true';
-  const results    = [];
-  const splitGroupId = uuidv4();
-
-  if (referrer.type === 'school') {
-    // Cek apakah school_enabled
-    if (settings.school_enabled !== 'true') return [];
-    const rate   = parseFloat(referrer.commission_rate) || parseFloat(settings.school_rate) || 30;
-    const amount = Math.round(amountIdr * rate / 100);
-    results.push({ referrerId: referrer.id, type: 'school', rate, amount, splitGroupId });
-
-    // Cek apakah ada marketing yang linked ke sekolah ini (split fee)
-    if (splitActive && settings.marketing_enabled === 'true') {
-      const link = await db.query(
-        `SELECT sml.marketing_id, r.commission_rate, r.is_active
-           FROM school_marketing_links sml
-           JOIN referrers r ON r.id = sml.marketing_id
-          WHERE sml.school_id = $1 AND sml.is_active = true AND r.is_active = true
-          LIMIT 1`,
-        [referrer.id]
-      );
-      if (link.rowCount > 0) {
-        const mRate   = parseFloat(link.rows[0].commission_rate) || parseFloat(settings.marketing_rate) || 10;
-        const mAmount = Math.round(amountIdr * mRate / 100);
-        results.push({ referrerId: link.rows[0].marketing_id, type: 'marketing', rate: mRate, amount: mAmount, splitGroupId });
-      }
-    }
-  } else if (referrer.type === 'marketing') {
-    if (settings.marketing_enabled !== 'true') return [];
-    const rate   = parseFloat(referrer.commission_rate) || parseFloat(settings.marketing_rate) || 10;
-    const amount = Math.round(amountIdr * rate / 100);
-    results.push({ referrerId: referrer.id, type: 'marketing', rate, amount, splitGroupId });
-  } else if (referrer.type === 'parent') {
-    if (settings.parent_enabled !== 'true') return [];
-    const rate   = parseFloat(referrer.commission_rate) || parseFloat(settings.parent_rate) || 5;
-    const amount = Math.round(amountIdr * rate / 100);
-    results.push({ referrerId: referrer.id, type: 'parent', rate, amount, splitGroupId });
-  } else if (referrer.type === 'student') {
-    if (settings.student_enabled !== 'true') return [];
-    const rate   = parseFloat(referrer.commission_rate) || parseFloat(settings.student_rate) || 5;
-    const amount = Math.round(amountIdr * rate / 100);
-    results.push({ referrerId: referrer.id, type: 'student', rate, amount, splitGroupId });
-  }
-
-  return results;
+  return feeMatrix.calcSplitFee(referrerCode, amountIdr, settings);
 }
 
-// ?? Helper: simpan earnings ke DB ????????????????????????????????????????????
+// Helper: simpan earnings ke DB
 async function saveEarnings(earnings, paymentRecordId, studentId, amountIdr) {
-  for (const e of earnings) {
-    await db.query(
-      `INSERT INTO referrer_earnings
-         (referrer_id, payment_record_id, student_id, amount_idr,
-          commission_rate, commission_idr, split_group_id, referrer_type)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [e.referrerId, paymentRecordId, studentId, amountIdr,
-       e.rate, e.amount, e.splitGroupId, e.type]
-    );
-    await db.query(
-      `UPDATE referrers SET
-         total_conversions  = total_conversions + 1,
-         total_earnings_idr = total_earnings_idr + $1
-       WHERE id = $2`,
-      [e.amount, e.referrerId]
-    );
-  }
+  return feeMatrix.saveEarnings(earnings, { paymentRecordId, studentId, amountIdr });
 }
+router.get('/marketing/overview', async (req, res) => {
+  try {
+    const settings = await feeMatrix.getSettings();
+    const partners = await db.query(`SELECT type, COUNT(*)::int AS total,
+      COALESCE(SUM(total_earnings_idr),0)::int AS total_earnings_idr
+      FROM referrers WHERE status='approved' AND is_active=true GROUP BY type ORDER BY type`);
+    const payments = await db.query(`SELECT
+      COUNT(*) FILTER (WHERE is_confirmed=TRUE)::int AS confirmed_count,
+      COALESCE(SUM(amount_idr) FILTER (WHERE is_confirmed=TRUE),0)::int AS confirmed_idr,
+      COUNT(*) FILTER (WHERE is_confirmed=FALSE)::int AS pending_count FROM payment_records`);
+    const earnings = await db.query(`SELECT
+      COALESCE(SUM(commission_idr) FILTER (WHERE status<>'cancelled'),0)::int AS total_idr,
+      COALESCE(SUM(commission_idr) FILTER (WHERE status='ready'),0)::int AS ready_idr,
+      COALESCE(SUM(commission_idr) FILTER (WHERE status='transferred'),0)::int AS transferred_idr,
+      COALESCE(SUM(commission_idr) FILTER (WHERE status='cancelled'),0)::int AS cancelled_idr,
+      COALESCE(SUM(commission_idr) FILTER (WHERE earning_type='transaction'),0)::int AS normal_idr,
+      COALESCE(SUM(commission_idr) FILTER (WHERE earning_type='quota_catchup'),0)::int AS catchup_idr
+      FROM referrer_earnings`);
+    const queue = await readyPayoutQueue();
+    res.json({ settings, partners: partners.rows, payments: payments.rows[0] || {},
+      earnings: earnings.rows[0] || {}, payout_queue: summarizeQueue(queue) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
-// ?? STUDENTS ??????????????????????????????????????????????????????????????????
+
+// Students
 router.get('/students', async (req, res) => {
   try {
     const page   = Math.max(1, parseInt(req.query.page)  || 1);
@@ -227,7 +183,71 @@ router.get('/students/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ?? REFERRERS ?????????????????????????????????????????????????????????????????
+// Admin test accounts (M7). Optional owner_id targets a Head Marketing.
+router.post('/test-accounts', async (req, res) => {
+  try {
+    const result = await marketingTestAccounts.createTestAccount({
+      ownerId: req.body?.owner_referrer_id || null, createdByAdmin: true, label: req.body?.label || null,
+    });
+    return res.status(201).json(result);
+  } catch (err) { return res.status(err.status || 500).json({ error: err.message }); }
+});
+
+router.get('/test-accounts', async (req, res) => {
+  try { return res.json({ test_accounts: await marketingTestAccounts.listTestAccounts({ admin: true }) }); }
+  catch (err) { return res.status(500).json({ error: err.message }); }
+});
+
+router.post('/test-accounts/:id/revoke', async (req, res) => {
+  try {
+    const row = await marketingTestAccounts.revokeTestAccount({ id: req.params.id, admin: true });
+    return res.json({ ok: true, test_account: row });
+  } catch (err) { return res.status(err.status || 500).json({ error: err.message }); }
+});
+
+
+// Secure partner invites. Raw token is returned only once; DB stores hash only.
+router.post('/partner-invites', async (req, res) => {
+  try {
+    const result = await partnerInvites.createInvite({
+      targetType: req.body?.target_type,
+      inviterId: req.body?.inviter_referrer_id || null,
+      createdByAdmin: true,
+      expiresHours: req.body?.expires_hours,
+    });
+    return res.status(201).json(result);
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/partner-invites', async (req, res) => {
+  try {
+    const rows = await db.query(
+      `SELECT i.id, i.target_type, i.created_by_admin, i.expires_at,
+              i.used_at, i.used_referrer_id, i.revoked_at, i.created_at,
+              r.full_name AS inviter_name, r.referral_code AS inviter_code
+       FROM partner_invites i
+       LEFT JOIN referrers r ON r.id=i.inviter_referrer_id
+       ORDER BY i.created_at DESC LIMIT 200`
+    );
+    return res.json({ invites: rows.rows });
+  } catch (err) { return res.status(500).json({ error: err.message }); }
+});
+
+router.post('/partner-invites/:id/revoke', async (req, res) => {
+  try {
+    const rows = await db.query(
+      `UPDATE partner_invites SET revoked_at=COALESCE(revoked_at,NOW())
+       WHERE id=$1::uuid AND used_at IS NULL RETURNING id,revoked_at`,
+      [req.params.id]
+    );
+    if (!rows.rowCount) return res.status(409).json({ error: 'Invite sudah dipakai atau tidak ditemukan.' });
+    return res.json({ ok: true, invite: rows.rows[0] });
+  } catch (err) { return res.status(500).json({ error: err.message }); }
+});
+
 router.get('/referrers', async (req, res) => {
   try {
     const type = req.query.type; // filter by type optional
@@ -252,34 +272,56 @@ router.get('/referrers', async (req, res) => {
 
 router.post('/referrers', async (req, res) => {
   const { full_name, email, password, referral_code, type,
-          commission_rate, bank_name, bank_account_number, bank_account_name } = req.body || {};
+          commission_rate, bank_name, bank_account_number, bank_account_name,
+          parent_referrer_id } = req.body || {};
   if (!full_name || !email || !password || !referral_code || !type) {
     return res.status(400).json({ error: 'full_name, email, password, referral_code, type wajib' });
   }
-  if (!['school','marketing','parent','student'].includes(type)) {
-    return res.status(400).json({ error: 'type harus: school | marketing | parent | student' });
+  // A2: tipe 'sales' = referrer di bawah head marketing (marketing.md bagian 1-2)
+  if (!['school','marketing','parent','student','sales'].includes(type)) {
+    return res.status(400).json({ error: 'type harus: school | marketing | parent | student | sales' });
   }
   try {
     const settings     = await getSettings();
-    const defaultRates = { school: settings.school_rate, marketing: settings.marketing_rate,
-                           parent: settings.parent_rate,  student: settings.student_rate };
+    const defaultRates = { school: settings.school_rate, marketing: settings.head_marketing_rate || settings.marketing_rate,
+                           parent: settings.parent_rate,  student: settings.student_rate,
+                           sales:  settings.sales_rate };
     const rate         = commission_rate || defaultRates[type] || 10;
+
+    // sales WAJIB punya induk head marketing yang valid & aktif
+    let parentUuid = null;
+    if (type === 'sales') {
+      if (!parent_referrer_id) {
+        return res.status(400).json({ error: 'type sales wajib menyertakan parent_referrer_id (id head marketing)' });
+      }
+      const p = await db.query(
+        "SELECT id FROM referrers WHERE id = $1 AND type = 'marketing' AND is_active = true AND status = 'approved'",
+        [parent_referrer_id]);
+      if (p.rowCount === 0) {
+        return res.status(400).json({ error: 'parent_referrer_id bukan head marketing yang aktif/approved' });
+      }
+      parentUuid = p.rows[0].id;
+    }
+
     const password_hash  = await bcrypt.hash(password, 10);
     const referral_token = uuidv4().replace(/-/g, '').slice(0, 16);
 
     const r = await db.query(`
       INSERT INTO referrers
         (full_name, email, password_hash, referral_code, referral_token,
-         type, commission_rate, bank_name, bank_account_number, bank_account_name, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'approved')
+         type, commission_rate, bank_name, bank_account_number, bank_account_name,
+         parent_referrer_id, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'approved')
       RETURNING id, full_name, email, type, referral_code, referral_token,
-                commission_rate, status
+                commission_rate, parent_referrer_id, status
     `, [full_name, email, password_hash, referral_code, referral_token,
-        type, rate, bank_name, bank_account_number, bank_account_name]);
+        type, rate, bank_name, bank_account_number, bank_account_name, parentUuid]);
 
     res.status(201).json({ ok: true, referrer: r.rows[0] });
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'email atau referral_code sudah dipakai' });
+    if (err.code === '22P02') return res.status(400).json({ error: 'parent_referrer_id harus UUID valid' });
+    if (err.code === '23503') return res.status(400).json({ error: 'parent_referrer_id tidak ditemukan' });
     res.status(500).json({ error: err.message });
   }
 });
@@ -309,7 +351,7 @@ router.put('/referrers/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ?? REFERRAL SETTINGS ?????????????????????????????????????????????????????????
+// Referral settings
 router.get('/referral-settings', async (req, res) => {
   try {
     const rows = await db.query('SELECT key, value, description, updated_at FROM referral_settings ORDER BY key');
@@ -320,9 +362,14 @@ router.get('/referral-settings', async (req, res) => {
 router.put('/referral-settings', async (req, res) => {
   // Body: { key: value, key2: value2, ... }
   const updates = req.body || {};
+  // A5: whitelist key matriks owner (migrasi 021) + key lama agar tetap bisa diubah
   const allowed = ['school_rate','marketing_rate','parent_rate','student_rate',
                    'school_enabled','marketing_enabled','parent_enabled',
-                   'student_enabled','split_fee_enabled'];
+                   'student_enabled','split_fee_enabled',
+                   'head_marketing_rate','teacher_rate_full','teacher_quota_full',
+                   'teacher_rate_half','teacher_quota_half',
+                   'sales_rate','sales_quota',
+                   'demo_no_persist_enabled'];
   try {
     const results = [];
     for (const [key, value] of Object.entries(updates)) {
@@ -338,7 +385,7 @@ router.put('/referral-settings', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ?? SCHOOL-MARKETING LINKS ????????????????????????????????????????????????????
+// School marketing links
 router.get('/school-marketing-links', async (req, res) => {
   try {
     const rows = await db.query(`
@@ -411,7 +458,7 @@ router.delete('/school-marketing-links/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ?? PAYMENTS ??????????????????????????????????????????????????????????????????
+// Payments
 router.get('/payments', async (req, res) => {
   try {
     const page   = Math.max(1, parseInt(req.query.page)  || 1);
@@ -446,7 +493,7 @@ router.get('/payments', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ?? EARNINGS ??????????????????????????????????????????????????????????????????
+// Earnings
 router.get('/earnings', async (req, res) => {
   try {
     const status = req.query.status || 'pending';
@@ -474,10 +521,10 @@ router.put('/earnings/:id', async (req, res) => {
     const e = await db.query(`
       UPDATE referrer_earnings
       SET status = 'transferred', transferred_at = NOW()
-      WHERE id = $1 AND status = 'pending'
+      WHERE id = $1 AND status IN ('pending','ready')
       RETURNING *
     `, [req.params.id]);
-    if (e.rowCount === 0) return res.status(404).json({ error: 'earning tidak ditemukan atau sudah ditransfer' });
+    if (e.rowCount === 0) return res.status(404).json({ error: 'earning tidak ditemukan atau statusnya bukan pending/ready' });
     await db.query(
       'UPDATE referrers SET total_transferred_idr = total_transferred_idr + $1 WHERE id = $2',
       [e.rows[0].commission_idr, e.rows[0].referrer_id]);
@@ -485,7 +532,65 @@ router.put('/earnings/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ?? BILLING ???????????????????????????????????????????????????????????????????
+// A4: PAYOUT BORONGAN — semua earning 'ready' milik satu referrer (atau semua
+// referrer) dicairkan dalam satu perintah. Kuota tier sudah diverifikasi saat
+// invoice lunas (midtrans.js referralTierRate), jadi baris 'ready' di sini pasti
+// sudah lolos kuota. Status DB langsung 'transferred'; transfer bank nyata tetap
+// dilakukan owner karena repo ini tidak punya API disbursement.
+router.get('/earnings/payout-queue', async (req, res) => {
+  try {
+    const queue = await readyPayoutQueue();
+    res.json({ queue, summary: summarizeQueue(queue) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.post('/earnings/payout', async (req, res) => {
+  const referrerId = (req.body || {}).referrer_id || null;
+  try {
+    const rows = await db.query(
+      `UPDATE referrer_earnings
+          SET status = 'transferred', transferred_at = NOW()
+        WHERE status = 'ready' ${referrerId ? 'AND referrer_id = $1' : ''}
+        RETURNING id, referrer_id, commission_idr`,
+      referrerId ? [referrerId] : []
+    );
+    if (rows.rowCount === 0) {
+      return res.status(404).json({ error: 'Tidak ada earning berstatus ready untuk dicairkan' });
+    }
+
+    // Akumulasi per referrer → naikkan total_transferred_idr sekali per referrer
+    const perRef = new Map();
+    for (const r of rows.rows) {
+      perRef.set(r.referrer_id, (perRef.get(r.referrer_id) || 0) + r.commission_idr);
+    }
+    for (const [id, total] of perRef) {
+      await db.query(
+        'UPDATE referrers SET total_transferred_idr = total_transferred_idr + $1 WHERE id = $2',
+        [total, id]);
+    }
+
+    const banks = await db.query(
+      `SELECT id, full_name, type AS referrer_type, bank_name,
+              bank_account_number, bank_account_name
+         FROM referrers WHERE id = ANY($1::uuid[])`,
+      [Array.from(perRef.keys())]
+    );
+    const batches = banks.rows.map((b) => ({
+      ...b,
+      transferred_idr: perRef.get(b.id) || 0,
+      bank_complete: !!(b.bank_name && b.bank_account_number),
+    }));
+    res.json({
+      ok: true,
+      earnings_count: rows.rowCount,
+      referrers_count: batches.length,
+      total_idr: batches.reduce((a, b) => a + b.transferred_idr, 0),
+      batches,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Billing
 router.post('/billing/activate', async (req, res) => {
   const { student_id, product_type, level_from, level_to,
           amount_idr, payment_method, proof_note, referrer_code } = req.body || {};
@@ -734,7 +839,7 @@ function randomCode() {
 router.get('/demo-passcodes', allowAdminOrMarketing, async (req, res) => {
   try {
     const rows = await db.query(
-      `SELECT id, code, label, expires_at, redeemed_at, is_active, created_at
+      `SELECT id, code, label, expires_at, redeemed_at, no_persist, is_active, created_at
        FROM demo_passcodes ORDER BY created_at DESC`
     );
     res.json({ passcodes: rows.rows });
@@ -742,8 +847,9 @@ router.get('/demo-passcodes', allowAdminOrMarketing, async (req, res) => {
 });
 
 router.post('/demo-passcodes', allowAdminOrMarketing, async (req, res) => {
-  // Body opsional: { label: "Demo SMP Banjarbaru", hours: 0.5 }
-  const { label, hours } = req.body || {};
+  // Body opsional: { label: "Demo SMP Banjarbaru", hours: 0.5, no_persist: true }
+  // A3: no_persist=true → sesi latihan pemegang passcode ini TIDAK disimpan DB.
+  const { label, hours, no_persist } = req.body || {};
   // Jika caller adalah referrer, pastikan type = marketing
   if (req.demoCallerKind === 'referrer') {
     try {
@@ -762,10 +868,10 @@ router.post('/demo-passcodes', allowAdminOrMarketing, async (req, res) => {
       code = randomCode();
       try {
         const r = await db.query(
-          `INSERT INTO demo_passcodes (code, label, expires_at)
-           VALUES ($1, $2, NOW() + INTERVAL '1 hour' * $3)
-           RETURNING id, code, label, expires_at, created_at`,
-          [code, label || null, ttlHours]
+          `INSERT INTO demo_passcodes (code, label, expires_at, no_persist)
+           VALUES ($1, $2, NOW() + INTERVAL '1 hour' * $3, $4)
+           RETURNING id, code, label, expires_at, no_persist, created_at`,
+          [code, label || null, ttlHours, no_persist === true]
         );
         res.status(201).json({ ok: true, passcode: r.rows[0] });
         inserted = true;

@@ -1,26 +1,36 @@
 /**
- * Placement Test API Endpoints
+ * Placement Test API Endpoints (v2 — speed-first)
  *
- * POST /api/placement/start     - Start placement test (get probe set)
- * POST /api/placement/submit    - Submit answers, get placement result
+ * POST /api/placement/start            - Start placement test (25 soal, L1-11)
+ * POST /api/placement/submit           - Submit answers, get placement result
  * GET  /api/placement/status/:studentId - Check placement status
+ *
+ * Rules (Placement_Test_System.md §5):
+ *   - 25 questions: L1-4 @2, L5-9 @3, L10-11 @1 (ceiling probes)
+ *   - Hard limit 8000 ms per question; correct-but-slow = FAIL
+ *   - Level pass = accuracy >= 80% AND avg_time <= 8000 ms
+ *   - placed_level = first failed level (clamp 1..9); all-pass → 9 (MAX)
+ *   - Early stop after 3 consecutive fails (wrong OR timeout)
  */
-
 const express = require('express');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 const db = require('../database/db');
+const engine = require('../services/placementEngine');
 
-// Target times from SPEED_TARGETS_QUICK_REFERENCE (ms)
-const TARGET_TIMES = {
-  1: 15000, 2: 12000, 3: 10000, 4: 9000, 5: 8000,
-  6: 9000, 7: 9000, 8: 8000, 9: 6000, 10: 13500,
-  11: 17500, 12: 17500, 13: 25000, 14: 25000, 15: 10000
-};
+// jsonb columns come back as parsed objects from pg; normalize defensively
+function parseJsonb(value) {
+  if (value == null) return null;
+  if (typeof value === 'string') {
+    try { return JSON.parse(value); } catch { return null; }
+  }
+  return value;
+}
 
 /**
  * POST /api/placement/start
- * Start a placement test - returns a probe set
+ * Start a placement test — builds a fresh 25-question set from the catalog.
+ * Body: { studentId, visualOnly? }
  */
 router.post('/start', async (req, res) => {
   try {
@@ -30,12 +40,11 @@ router.post('/start', async (req, res) => {
       return res.status(400).json({ error: 'studentId is required' });
     }
 
-    // Check if student already has a completed placement
+    // Block re-test if already completed
     const existing = await db.query(
-      'SELECT * FROM placement_tests WHERE student_id = $1 AND status = $2',
+      'SELECT id, placed_level FROM placement_tests WHERE student_id = $1 AND status = $2 ORDER BY completed_at DESC LIMIT 1',
       [studentId, 'completed']
     );
-
     if (existing.rows.length > 0) {
       return res.status(409).json({
         error: 'Placement test already completed',
@@ -44,52 +53,31 @@ router.post('/start', async (req, res) => {
       });
     }
 
-    // Get a random placement test from the pool
-    const startLevel = visualOnly ? 3 : 8;
-    const placementResult = await db.query(
-      'SELECT * FROM placement_tests WHERE status = $1 AND start_level = $2 LIMIT 1',
-      ['completed', startLevel]
+    // Cancel stale in-progress tests for this student
+    await db.query(
+      "UPDATE placement_tests SET status = 'abandoned' WHERE student_id = $1 AND status = 'in_progress'",
+      [studentId]
     );
 
-    if (placementResult.rows.length === 0) {
-      return res.status(404).json({ error: 'No placement test available' });
-    }
+    // Build the v2 question set (server-side copy includes correctAnswer)
+    const questionSet = engine.buildQuestionSet();
+    const clientQuestions = engine.toClientQuestions(questionSet);
 
-    const placement = placementResult.rows[0];
-    // pg returns JSONB as parsed JS object/array; handle both string and array
-    const probesRaw = placement.probes;
-    const exerciseIds = Array.isArray(probesRaw) ? probesRaw :
-      (typeof probesRaw === 'string' ? JSON.parse(probesRaw || '[]') : []);
-
-    // Get actual exercise data
-    const exercisesResult = await db.query(
-      `SELECT e.id, e.source_id, e.level_id, e.num1, e.num2, e.operation, e.correct_answer, e.question_text, e.hint_text, e.quick_trick, e.visualization_type, e.speech_text, COALESCE(c.code, 'general') as skill_code FROM exercises e LEFT JOIN concepts c ON e.concept_id = c.id WHERE e.source_id = ANY($1)`,
-      [exerciseIds]
+    const placementId = uuidv4();
+    await db.query(
+      `INSERT INTO placement_tests (id, student_id, start_level, current_level, probes, total_questions, status)
+       VALUES ($1, $2, $3, $4, $5, $6, 'in_progress')`,
+      [placementId, studentId, 1, 1, JSON.stringify(questionSet), engine.TOTAL_QUESTIONS]
     );
-
-    // Create in-progress placement test for student
-    const newPlacementId = uuidv4();
-    await db.query(`
-      INSERT INTO placement_tests (id, student_id, start_level, current_level, probes, status)
-      VALUES ($1, $2, $3, $4, $5, 'in_progress')
-    `, [newPlacementId, studentId, placement.start_level, placement.start_level, JSON.stringify(exerciseIds)]);
 
     res.json({
-      placementId: newPlacementId,
-      startLevel: placement.start_level,
+      placementId,
+      startLevel: 1,
       visualOnly,
-      exercises: exercisesResult.rows.map(ex => ({
-        id: ex.id,
-        level: ex.level_id,
-        problemText: ex.question_text,
-        num1: ex.num1,
-        num2: ex.num2,
-        operation: ex.operation,
-        visualizationType: ex.visualization_type,
-        speechText: ex.speech_text
-      }))
+      totalQuestions: engine.TOTAL_QUESTIONS,
+      timeLimitMs: engine.TIME_LIMIT_MS,
+      exercises: clientQuestions
     });
-
   } catch (error) {
     console.error('Error starting placement:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -98,7 +86,8 @@ router.post('/start', async (req, res) => {
 
 /**
  * POST /api/placement/submit
- * Submit placement answers and get result
+ * Body: { studentId, placementId, answers: [{ probeId|exerciseId, answer, timeTakenMs, timeout? }] }
+ * Answers MUST be in submission order (early-stop rule depends on it).
  */
 router.post('/submit', async (req, res) => {
   try {
@@ -108,92 +97,78 @@ router.post('/submit', async (req, res) => {
       return res.status(400).json({ error: 'studentId, placementId, and answers array are required' });
     }
 
-    // Get the placement test
     const placementResult = await db.query(
       'SELECT * FROM placement_tests WHERE id = $1 AND student_id = $2',
       [placementId, studentId]
     );
-
     if (placementResult.rows.length === 0) {
       return res.status(404).json({ error: 'Placement test not found' });
     }
 
     const placement = placementResult.rows[0];
-    // pg returns JSONB as parsed JS object/array; handle both string and array
-    const probesRaw = placement.probes;
-    const exerciseIds = Array.isArray(probesRaw) ? probesRaw :
-      (typeof probesRaw === 'string' ? JSON.parse(probesRaw || '[]') : []);
-
-    // Get correct answers — BUG FIX #1: include concept_id
-    const exercisesResult = await db.query(
-      `SELECT e.id, e.source_id, e.level_id, e.correct_answer, COALESCE(c.code, 'general') as skill_code FROM exercises e LEFT JOIN concepts c ON e.concept_id = c.id WHERE e.id = ANY($1)`,
-      [answers.map(a => a.exerciseId)]
-    );
-
-    const exerciseMap = {};
-    for (const ex of exercisesResult.rows) {
-      exerciseMap[ex.id] = ex;
+    if (placement.status === 'completed') {
+      return res.status(409).json({ error: 'Placement test already submitted', placedLevel: placement.placed_level });
     }
 
-    // Evaluate answers — BUG FIX #2: use level_id instead of level
-    const evaluatedAnswers = [];
-    for (const answer of answers) {
-      const exercise = exerciseMap[answer.exerciseId];
-      if (!exercise) continue;
-
-      const correct = parseFloat(answer.answer) === parseFloat(exercise.correct_answer);
-      evaluatedAnswers.push({
-        exerciseId: answer.exerciseId,
-        level: exercise.level_id,
-        skillArea: exercise.skill_code || 'general',
-        correct,
-        timeTakenMs: answer.timeTakenMs || null,
-        userAnswer: answer.answer,
-        correctAnswer: exercise.correct_answer
-      });
+    const questionSet = parseJsonb(placement.probes);
+    if (!Array.isArray(questionSet) || questionSet.length === 0) {
+      return res.status(500).json({ error: 'Placement question set corrupted' });
     }
 
-    // Calculate placement result
-    const result = calculatePlacement(evaluatedAnswers);
+    // Evaluate (speed + accuracy) in submission order
+    const evaluated = engine.evaluateAnswers(questionSet, answers);
 
-    // Write student_variant_bias (skills needing remediation)
-    const biasInserts = [];
-    // BUG FIX: correct_count / total_attempts dihitung PER-SKILL dari evaluatedAnswers,
-    // bukan dari agregat seluruh test.
+    // Cut at early-stop point (client may still send remaining answers)
+    let consecutive = 0;
+    let cutIndex = evaluated.length;
+    for (let i = 0; i < evaluated.length; i++) {
+      if (!evaluated[i].correct) {
+        consecutive += 1;
+        if (consecutive >= engine.EARLY_STOP_FAILS) { cutIndex = i + 1; break; }
+      } else {
+        consecutive = 0;
+      }
+    }
+    const evaluatedUsed = evaluated.slice(0, cutIndex);
+
+    const result = engine.calculatePlacementV2(evaluatedUsed);
+    const evaluatedAll = evaluated;
+
+    // Write student_variant_bias (skills needing remediation) — per-skill stats
     for (const skill of Object.keys(result.prerequisite_signals || {})) {
-      const skillAnswers = evaluatedAnswers.filter(a => a.skillArea === skill);
+      const skillAnswers = evaluatedAll.filter(a => a.skillArea === skill);
       if (skillAnswers.length === 0) continue;
       const correctCount = skillAnswers.filter(a => a.correct).length;
       const accuracyPercent = Math.round((correctCount / skillAnswers.length) * 100);
-      if (accuracyPercent >= 100) continue; // tidak perlu remediasi
-      biasInserts.push({
-        skill,
-        correctCount,
-        totalAttempts: skillAnswers.length,
-        accuracyPercent
-      });
-    }
-    if (biasInserts.length > 0) {
-      for (const bias of biasInserts) {
-        await db.query(
-          'INSERT INTO student_variant_bias (student_id, placement_id, variant_type, correct_count, total_attempts, accuracy_percent, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW()) ON CONFLICT (student_id, placement_id, variant_type) DO UPDATE SET correct_count = $4, total_attempts = $5, accuracy_percent = $6, updated_at = NOW()',
-          [studentId, placementId, bias.skill, bias.correctCount, bias.totalAttempts, bias.accuracyPercent]
-        );
-      }
-      console.log('[PLACEMENT] Wrote ' + biasInserts.length + ' variant bias records');
+      if (accuracyPercent >= 100) continue;
+      await db.query(
+        'INSERT INTO student_variant_bias (student_id, placement_id, variant_type, correct_count, total_attempts, accuracy_percent, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW()) ON CONFLICT (student_id, placement_id, variant_type) DO UPDATE SET correct_count = $4, total_attempts = $5, accuracy_percent = $6, updated_at = NOW()',
+        [studentId, placementId, skill, correctCount, skillAnswers.length, accuracyPercent]
+      );
     }
 
-    // Save results
-    const resultsJson = JSON.stringify(evaluatedAnswers);
-    await db.query(`
-      UPDATE placement_tests
-      SET status = 'completed',
-          placed_level = $1,
-          prerequisite_signals = $2,
-          results = $3,
-          completed_at = NOW()
-      WHERE id = $4
-    `, [result.placed_level, JSON.stringify(result.prerequisite_signals), resultsJson, placementId]);
+    // Persist results
+    await db.query(
+      `UPDATE placement_tests
+       SET status = 'completed',
+           placed_level = $1,
+           prerequisite_signals = $2,
+           results = $3,
+           level_breakdown = $4,
+           early_stop_reason = $5,
+           total_questions = $6,
+           completed_at = NOW()
+       WHERE id = $7`,
+      [
+        result.placed_level,
+        JSON.stringify(result.prerequisite_signals),
+        JSON.stringify(evaluatedAll),
+        JSON.stringify(result.level_breakdown),
+        result.early_stop_reason,
+        engine.TOTAL_QUESTIONS,
+        placementId
+      ]
+    );
 
     // Update student's current level
     await db.query(
@@ -201,17 +176,34 @@ router.post('/submit', async (req, res) => {
       [result.placed_level, result.placed_level, studentId]
     );
 
+    // Aktivasi kredit menggantung (Pintu 1: ortu bayar sebelum placement).
+    // Scope aktif = [placed_level .. placed_level + pending_levels - 1].
+    // Gagal aktivasi TIDAK boleh menggagalkan placement — dicatat & dilanjutkan.
+    let activation = null;
+    try {
+      const access = require('../services/accessService');
+      activation = await access.activatePendingPurchases(db, studentId, result.placed_level);
+    } catch (actErr) {
+      console.error('[placement/submit] aktivasi kredit pending gagal:', actErr.message);
+    }
+
     res.json({
       placementId,
       placedLevel: result.placed_level,
+      levelBreakdown: result.level_breakdown,
+      earlyStopped: result.early_stopped,
+      earlyStopReason: result.early_stop_reason,
+      stats: result.stats,
       prerequisiteSignals: result.prerequisite_signals,
       speedEmphasis: result.speed_emphasis,
       accuracyByLevel: result.accuracy_by_level,
       speedByLevel: result.speed_by_level,
-      totalAnswers: evaluatedAnswers.length,
-      correctAnswers: evaluatedAnswers.filter(a => a.correct).length
+      totalAnswers: evaluatedAll.length,
+      correctAnswers: evaluatedAll.filter(a => a.correct).length,
+      ...(activation && activation.activated.length > 0 && {
+        purchaseActivation: activation
+      })
     });
-
   } catch (error) {
     console.error('Error submitting placement:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -220,140 +212,43 @@ router.post('/submit', async (req, res) => {
 
 /**
  * GET /api/placement/status/:studentId
- * Check placement status for a student
  */
 router.get('/status/:studentId', async (req, res) => {
   try {
     const { studentId } = req.params;
 
-    const result = await db.query(
-      'SELECT id, start_level, placed_level, status, started_at, completed_at FROM placement_tests WHERE student_id = $1 ORDER BY started_at DESC LIMIT 1',
+    const completed = await db.query(
+      'SELECT * FROM placement_tests WHERE student_id = $1 AND status = $2 ORDER BY completed_at DESC LIMIT 1',
+      [studentId, 'completed']
+    );
+
+    if (completed.rows.length > 0) {
+      const t = completed.rows[0];
+      return res.json({
+        hasCompleted: true,
+        placementId: t.id,
+        placedLevel: t.placed_level,
+        earlyStopReason: t.early_stop_reason,
+        levelBreakdown: parseJsonb(t.level_breakdown),
+        prerequisiteSignals: parseJsonb(t.prerequisite_signals),
+        completedAt: t.completed_at
+      });
+    }
+
+    const inProgress = await db.query(
+      "SELECT id, started_at FROM placement_tests WHERE student_id = $1 AND status = 'in_progress' ORDER BY started_at DESC LIMIT 1",
       [studentId]
     );
 
-    if (result.rows.length === 0) {
-      return res.json({ status: 'not_started', studentId });
-    }
-
-    const placement = result.rows[0];
     res.json({
-      studentId,
-      placementId: placement.id,
-      status: placement.status,
-      startLevel: placement.start_level,
-      placedLevel: placement.placed_level,
-      startedAt: placement.started_at,
-      completedAt: placement.completed_at
+      hasCompleted: false,
+      inProgress: inProgress.rows.length > 0,
+      placementId: inProgress.rows[0]?.id || null
     });
-
   } catch (error) {
-    console.error('Error checking placement status:', error);
+    console.error('Error fetching placement status:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
-
-/**
- * Calculate placement result based on accuracy and speed
- * BUG FIX #3: Proper fallback logic when accuracy < 80% across all levels
- */
-function calculatePlacement(answers) {
-  if (!answers || answers.length === 0) {
-    return { placed_level: 1, prerequisite_signals: {}, speed_emphasis: 'low' };
-  }
-
-  // Group by level
-  const byLevel = {};
-  for (const a of answers) {
-    if (!byLevel[a.level]) byLevel[a.level] = [];
-    byLevel[a.level].push(a);
-  }
-
-  // Calculate accuracy per level
-  const accuracyByLevel = {};
-  for (const [level, items] of Object.entries(byLevel)) {
-    const correct = items.filter(a => a.correct).length;
-    accuracyByLevel[parseInt(level)] = correct / items.length;
-  }
-
-  // Calculate average speed per level (relative to target)
-  const speedByLevel = {};
-  for (const [level, items] of Object.entries(byLevel)) {
-    const times = items.filter(a => a.timeTakenMs).map(a => a.timeTakenMs);
-    if (times.length > 0) {
-      const avgTime = times.reduce((a, b) => a + b, 0) / times.length;
-      const target = TARGET_TIMES[parseInt(level)] || 10000;
-      speedByLevel[parseInt(level)] = Math.round((avgTime / target) * 100) / 100;
-    }
-  }
-
-  // Find placed level: highest level with >= 80% accuracy
-  let placedLevel = 1;
-  const sortedLevels = Object.keys(accuracyByLevel).map(Number).sort((a, b) => b - a);
-  for (const level of sortedLevels) {
-    if (accuracyByLevel[level] >= 0.8) {
-      placedLevel = level;
-      break;
-    }
-  }
-
-  // If placed level > start level with low accuracy, warn but place at highest passing level
-  // If NO level passes 80%, fallback to level 1 (remedial)
-  if (placedLevel === 1 && sortedLevels.length > 0 && accuracyByLevel[sortedLevels[0]] < 0.8) {
-    console.warn(`[PLACEMENT] All levels < 80% accuracy. Placing at level 1 (remedial).`);
-  }
-
-  // Calculate prerequisite signals (skill areas that need work)
-  const prerequisiteSignals = {};
-  for (const [level, items] of Object.entries(byLevel)) {
-    const l = parseInt(level);
-    const correct = items.filter(a => a.correct).length;
-    const accuracy = correct / items.length;
-
-    const isRemedial = placedLevel === 1 && sortedLevels.length > 0 && accuracyByLevel[sortedLevels[0]] < 0.8;
-    if (accuracy < 0.8 && (l <= placedLevel || isRemedial)) {
-      const skillAreas = {};
-      for (const item of items) {
-        if (!item.correct) {
-          const skill = item.skillArea || 'general';
-          skillAreas[skill] = (skillAreas[skill] || 0) + 1;
-        }
-      }
-      for (const [skill, count] of Object.entries(skillAreas)) {
-        prerequisiteSignals[skill] = Math.round((count / items.length) * 100) / 100;
-      }
-    }
-  }
-
-  // Determine speed emphasis
-  let speedEmphasis = 'low';
-  const placedSpeed = speedByLevel[placedLevel];
-  if (placedSpeed !== undefined) {
-    if (placedSpeed > 1.5) speedEmphasis = 'high';
-    else if (placedSpeed > 1.2) speedEmphasis = 'medium';
-  }
-
-  return {
-    placed_level: placedLevel,
-    prerequisite_signals: prerequisiteSignals,
-    speed_emphasis: speedEmphasis,
-    accuracy_by_level: accuracyByLevel,
-    speed_by_level: speedByLevel
-  };
-}
-
-/**
- * Extract skill area from concept_id
- */
-function extractSkillArea(conceptId) {
-  if (!conceptId) return 'general';
-  if (conceptId.includes('add')) return 'addition_facts';
-  if (conceptId.includes('sub')) return 'subtraction_facts';
-  if (conceptId.includes('mult') || conceptId.includes('mul')) return 'multiplication_tables';
-  if (conceptId.includes('div')) return 'division_basics';
-  if (conceptId.includes('frac')) return 'fractions';
-  if (conceptId.includes('dec')) return 'decimals';
-  if (conceptId.includes('mixed')) return 'mixed_operations';
-  return 'general';
-}
 
 module.exports = router;
